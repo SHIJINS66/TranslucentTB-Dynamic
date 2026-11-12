@@ -1,0 +1,266 @@
+﻿{
+  "$schema": "https://json-schema.org/draft/2019-09/schema#",
+  "title": "TranslucentTB Settings Schema",
+  "$defs": {
+    "TaskbarAppearance": {
+      "properties": {
+        "accent": {
+          "enum": [
+            "normal",
+            "opaque",
+            "clear",
+            "blur",
+            "acrylic"
+          ],
+          "type": "string"
+        },
+        "color": {
+          "pattern": "^#([A-Fa-f0-9]{3}|[A-Fa-f0-9]{4}|[A-Fa-f0-9]{6}|[A-Fa-f0-9]{8})$",
+          "type": "string",
+          "format": "color"
+        },
+        "show_peek": {
+          "type": "boolean"
+        },
+        "show_line": {
+          "type": "boolean"
+        },
+        "blur_radius": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 750
+        }
+      },
+      "type": "object"
+    },
+    "OptionalTaskbarAppearance": {
+      "allOf": [
+        {
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/TaskbarAppearance"
+        }
+      ]
+    },
+    "RuleSet": {
+      "allOf": [
+        {
+          "properties": {
+            "inactive": {
+              "$ref": "#/$defs/TaskbarAppearance"
+            }
+          }
+        },
+        {
+          "$ref": "#/$defs/TaskbarAppearance"
+        }
+      ]
+    },
+    "RuledTaskbarAppearance": {
+      "allOf": [
+        {
+          "properties": {
+            "rules": {
+              "properties": {
+                "window_class": {
+                  "additionalProperties": {
+                    "$ref": "#/$defs/RuleSet"
+                  }
+                },
+                "window_title": {
+                  "additionalProperties": {
+                    "$ref": "#/$defs/RuleSet"
+                  }
+                },
+                "process_name": {
+                  "additionalProperties": {
+                    "$ref": "#/$defs/RuleSet"
+                  }
+                }
+              }
+            }
+          },
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/OptionalTaskbarAppearance"
+        }
+      ]
+    },
+    "FilterSet": {
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true,
+      "type": "array"
+    }
+  },
+  "properties": {
+    "desktop_appearance": {
+      "$ref": "#/$defs/TaskbarAppearance"
+    },
+    "visible_window_appearance": {
+      "$ref": "#/$defs/RuledTaskbarAppearance"
+    },
+    "maximized_window_appearance": {
+      "$ref": "#/$defs/RuledTaskbarAppearance"
+    },
+    "start_opened_appearance": {
+      "$ref": "#/$defs/OptionalTaskbarAppearance"
+    },
+    "search_opened_appearance": {
+      "$ref": "#/$defs/OptionalTaskbarAppearance"
+    },
+    "task_view_opened_appearance": {
+      "$ref": "#/$defs/OptionalTaskbarAppearance"
+    },
+    "battery_saver_appearance": {
+      "$ref": "#/$defs/OptionalTaskbarAppearance"
+    },
+    "ignored_windows": {
+      "properties": {
+        "window_class": {
+          "$ref": "#/$defs/FilterSet"
+        },
+        "window_title": {
+          "$ref": "#/$defs/FilterSet"
+        },
+        "process_name": {
+          "$ref": "#/$defs/FilterSet"
+        }
+      },
+      "type": "object"
+    },
+    "hide_tray": {
+      "type": "boolean"
+    },
+    "disable_saving": {
+      "type": "boolean"
+    },
+    "verbosity": {
+      "enum": [
+        "trace",
+        "debug",
+        "info",
+        "warn",
+        "err",
+        "critical",
+        "off"
+      ],
+      "type": "string"
+    },
+    "language": {
+      "pattern": "^[a-z]{2}(-[A-Z]{2})?$",
+      "type": "string"
+    },
+    "use_xaml_context_menu": {
+      "type": "boolean"
+    },
+    "copy_dlls": {
+      "type": "boolean"
+    },
+    "dynamic_tint": {
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "only_fullscreen": {
+          "type": "boolean"
+        },
+        "samples_per_second": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60
+        },
+        "fps": {
+          "type": "integer",
+          "minimum": 20,
+          "maximum": 120
+        },
+        "smoothing": {
+          "type": "number",
+          "minimum": 0.01,
+          "maximum": 1
+        },
+        "min_value": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "max_value": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "saturation_boost": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 4
+        },
+        "alpha": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "sample_depth": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4096
+        },
+        "sample_width": {
+          "type": "integer",
+          "minimum": 4,
+          "maximum": 512
+        },
+        "zones": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32
+        },
+        "near_bias": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "sample_interval": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000
+        },
+        "median_window": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9
+        },
+        "deadband": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60
+        },
+        "cut_threshold": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 765
+        },
+        "cut_duration_ms": {
+          "type": "integer",
+          "minimum": 40,
+          "maximum": 2000
+        },
+        "adaptive_sampling": {
+          "type": "boolean",
+          "default": true,
+          "description": "Event hints plus low-rate fallback; false preserves continuous sampling."
+        }
+      },
+      "type": "object"
+    }
+  },
+  "type": "object"
+}
