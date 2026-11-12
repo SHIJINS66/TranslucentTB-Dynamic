@@ -1,0 +1,12 @@
+import "Pages/FramelessPage.idl";
+
+namespace TranslucentTB.Xaml.Pages
+{
+    delegate void DynamicTintParametersCommittedDelegate(Int32 zones, Int32 fps, Int32 samplesPerSecond, Int32 sampleDepth, Boolean adaptiveSampling);
+
+    runtimeclass DynamicTintSettingsPage : FramelessPage
+    {
+        DynamicTintSettingsPage(Int32 zones, Int32 fps, Int32 samplesPerSecond, Int32 sampleDepth, Boolean adaptiveSampling);
+        event DynamicTintParametersCommittedDelegate ParametersCommitted;
+    }
+}

@@ -1,0 +1,29 @@
+<local:FramelessPage
+    x:Class="TranslucentTB.Xaml.Pages.DynamicTintSettingsPage"
+    x:Uid="DynamicTintSettingsPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:TranslucentTB.Xaml.Pages"
+    xmlns:muxc="using:Microsoft.UI.Xaml.Controls"
+    IsClosable="True" Width="440">
+    <ScrollViewer MaxHeight="620" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+        <StackPanel Margin="24,16,24,24" Spacing="12">
+            <TextBlock x:Uid="DynamicTintSettingsPage_Intro" TextWrapping="Wrap" />
+            <ComboBox x:Name="SamplingModeBox" x:Uid="DynamicTintSettingsPage_Mode" HorizontalAlignment="Stretch">
+                <ComboBoxItem x:Uid="DynamicTintSettingsPage_Adaptive" />
+                <ComboBoxItem x:Uid="DynamicTintSettingsPage_Continuous" />
+            </ComboBox>
+            <muxc:NumberBox x:Name="ZonesBox" x:Uid="DynamicTintSettingsPage_Zones" Minimum="1" Maximum="32" SmallChange="1" LargeChange="4" SpinButtonPlacementMode="Inline" />
+            <muxc:NumberBox x:Name="FpsBox" x:Uid="DynamicTintSettingsPage_Fps" Minimum="20" Maximum="120" SmallChange="1" LargeChange="10" SpinButtonPlacementMode="Inline" />
+            <muxc:NumberBox x:Name="SamplingBox" x:Uid="DynamicTintSettingsPage_Sampling" Minimum="1" Maximum="60" SmallChange="1" LargeChange="5" SpinButtonPlacementMode="Inline" />
+            <muxc:NumberBox x:Name="DepthBox" x:Uid="DynamicTintSettingsPage_Depth" Minimum="0" Maximum="4096" SmallChange="1" LargeChange="16" SpinButtonPlacementMode="Inline" />
+            <TextBlock x:Uid="DynamicTintSettingsPage_Help" TextWrapping="Wrap" FontSize="12" Opacity="0.8" />
+            <TextBlock x:Name="ValidationMessage" x:Uid="DynamicTintSettingsPage_Error" TextWrapping="Wrap" Foreground="Firebrick" Visibility="Collapsed" />
+            <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right" Margin="0,8,0,0">
+                <Button x:Uid="DynamicTintSettingsPage_Defaults" Click="DefaultsClicked" />
+                <Button x:Uid="DynamicTintSettingsPage_Cancel" Click="CancelClicked" />
+                <Button x:Uid="DynamicTintSettingsPage_Apply" Click="ApplyClicked" Style="{StaticResource AccentButtonStyle}" />
+            </StackPanel>
+        </StackPanel>
+    </ScrollViewer>
+</local:FramelessPage>
