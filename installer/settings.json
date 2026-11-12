@@ -1,0 +1,97 @@
+// TranslucentTB Dynamic: community modified edition.
+{
+  "$schema": "https://TranslucentTB.github.io/settings.schema.json",
+  "desktop_appearance": {
+    "accent": "clear",
+    "color": "#00000000",
+    "show_peek": false,
+    "show_line": false,
+    "blur_radius": 9.0
+  },
+  "visible_window_appearance": {
+    "enabled": false,
+    "accent": "clear",
+    "color": "#00000000",
+    "show_peek": true,
+    "show_line": false,
+    "blur_radius": 9.0,
+    "rules": {
+      "window_class": {},
+      "window_title": {},
+      "process_name": {}
+    }
+  },
+  "maximized_window_appearance": {
+    "enabled": false,
+    "accent": "clear",
+    "color": "#00000000",
+    "show_peek": true,
+    "show_line": true,
+    "blur_radius": 9.0,
+    "rules": {
+      "window_class": {},
+      "window_title": {},
+      "process_name": {}
+    }
+  },
+  "start_opened_appearance": {
+    "enabled": false,
+    "accent": "normal",
+    "color": "#00000000",
+    "show_peek": true,
+    "show_line": true,
+    "blur_radius": 9.0
+  },
+  "search_opened_appearance": {
+    "enabled": false,
+    "accent": "normal",
+    "color": "#00000000",
+    "show_peek": true,
+    "show_line": true,
+    "blur_radius": 9.0
+  },
+  "task_view_opened_appearance": {
+    "enabled": true,
+    "accent": "normal",
+    "color": "#00000000",
+    "show_peek": false,
+    "show_line": true,
+    "blur_radius": 9.0
+  },
+  "battery_saver_appearance": {
+    "enabled": false,
+    "accent": "opaque",
+    "color": "#00000000",
+    "show_peek": true,
+    "show_line": false,
+    "blur_radius": 9.0
+  },
+  "ignored_windows": {
+    "window_class": [],
+    "window_title": [],
+    "process_name": []
+  },
+  "disable_saving": false,
+  "verbosity": "warn",
+  "dynamic_tint": {
+    "adaptive_sampling": true,
+    "enabled": true,
+    "only_fullscreen": false,
+    "samples_per_second": 30.0,
+    "fps": 120.0,
+    "smoothing": 0.1599999964237213,
+    "min_value": 0.11999999731779099,
+    "max_value": 0.6600000262260437,
+    "saturation_boost": 1.2000000476837158,
+    "alpha": 232.0,
+    "sample_depth": 0.0,
+    "sample_width": 96.0,
+    "zones": 10.0,
+    "near_bias": 0.949999988079071,
+    "sample_interval": 0.0,
+    "median_window": 5,
+    "deadband": 3.0,
+    "cut_threshold": 12,
+    "cut_duration_ms": 240.0
+  }
+}
