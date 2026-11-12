@@ -1,0 +1,11 @@
+{
+  "date": "2026-11-12",
+  "tests": 96,
+  "failures": 0,
+  "errors": 0,
+  "disabled": 0,
+  "suites": 44,
+  "skipped": 0,
+  "runtime_sha256": "23817D7A63F2C274D3698FCC48BA2DD6CD9B02271C54E4CC351942A50E4773A3",
+  "note": "Existing matching application build; documentation/package revision does not claim another build or UI run."
+}

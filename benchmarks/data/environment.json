@@ -1,0 +1,30 @@
+{
+  "date": "2026-11-12",
+  "cpu": "13th Gen Intel Core i9-13980HX",
+  "logical_processors": 32,
+  "os": "Windows 11 Pro for Workstations",
+  "os_build": "26300",
+  "display_count": 2,
+  "brightness_percent": 66,
+  "power_scheme": "Performance",
+  "power_source": "battery",
+  "target": "Taskbar button labelled ChatGPT; the current Codex desktop client (not a separately launched standard ChatGPT app)",
+  "zones": 16,
+  "render_fps": 120,
+  "requested_samples_per_second": 40,
+  "sample_depth": 0,
+  "pointer": "kept over the taskbar icon",
+  "order": [
+    "off",
+    "adaptive",
+    "continuous",
+    "continuous",
+    "adaptive",
+    "off"
+  ],
+  "settle_seconds_per_run": 8,
+  "measure_seconds_per_run": 48,
+  "cpu_interval_seconds": 1,
+  "battery_poll_seconds": 5,
+  "runtime_sha256": "23817D7A63F2C274D3698FCC48BA2DD6CD9B02271C54E4CC351942A50E4773A3"
+}
