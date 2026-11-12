@@ -1,0 +1,45 @@
+diff --git a/TranslucentTB/taskbar/taskbarattributeworker.cpp b/TranslucentTB/taskbar/taskbarattributeworker.cpp
+--- a/TranslucentTB/taskbar/taskbarattributeworker.cpp
++++ b/TranslucentTB/taskbar/taskbarattributeworker.cpp
+@@ -345,6 +345,7 @@
+ 		case 5: return static_cast<LRESULT>(m_DynamicInputs);
+ 		case 6: return GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+ 		case 7: return static_cast<LRESULT>(DynamicTint::CaptureAllocationCount());
++		case 8: return static_cast<LRESULT>(m_DynamicStops);
+ 		default: return 0;
+ 		}
+ 	}
+@@ -1155,6 +1156,14 @@
+ 
+ 	if (m_DynamicTargets.empty())
+ 	{
++		// A foreground change invalidates targets before the adaptive deadline
++		// permits another capture. Keep the displayed colours and cached brush
++		// through that gap; an empty pending target is not a request to restore
++		// every taskbar to its configured (often transparent) appearance.
++		if (!sampleDue)
++		{
++			return;
++		}
+ 		if (m_DynamicRunning)
+ 		{
+ 			StopDynamicTint(L"no fullscreen content to sample");
+@@ -1324,6 +1333,7 @@
+ 	}
+ 
+ 	const bool wasRunning = m_DynamicRunning;
++	if (wasRunning) ++m_DynamicStops;
+ 	m_DynamicRunning = false;
+ 	m_ShellFrozen = false;
+ 	m_ShellFreezeStart = { };
+diff --git a/TranslucentTB/taskbar/taskbarattributeworker.hpp b/TranslucentTB/taskbar/taskbarattributeworker.hpp
+--- a/TranslucentTB/taskbar/taskbarattributeworker.hpp
++++ b/TranslucentTB/taskbar/taskbarattributeworker.hpp
+@@ -167,6 +167,7 @@
+ 	DynamicTintSchedule m_DynamicSchedule;
+ 	UINT m_DynamicStatsMessage = RegisterWindowMessageW(L"TranslucentTB.DynamicTint.Stats.v1");
+ 	std::uint64_t m_DynamicTicks = 0, m_DynamicCaptures = 0, m_DynamicWrites = 0, m_DynamicInputs = 0;
++	std::uint64_t m_DynamicStops = 0;
+ 	bool m_DynamicRunning = false;
+ 	UINT m_DynamicInterval = 0;
+ 	std::unordered_map<HMONITOR, std::vector<Util::Color>> m_DynamicColors;

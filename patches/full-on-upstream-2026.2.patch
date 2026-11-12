@@ -1,0 +1,3058 @@
+diff --git a/Common/Common.vcxitems b/Common/Common.vcxitems
+--- a/Common/Common.vcxitems
++++ b/Common/Common.vcxitems
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+   <PropertyGroup Label="Globals">
+     <MSBuildAllProjects>$(MSBuildAllProjects);$(MSBuildThisFileFullPath)</MSBuildAllProjects>
+@@ -22,6 +22,9 @@
+     <ClInclude Include="$(MSBuildThisFileDirectory)undoc\explorer.hpp" />
+     <ClInclude Include="$(MSBuildThisFileDirectory)undoc\winternl.hpp" />
+     <ClInclude Include="$(MSBuildThisFileDirectory)util\color.hpp" />
++    <ClInclude Include="$(MSBuildThisFileDirectory)util\dynamictintschedule.hpp" />
++    <ClInclude Include="$(MSBuildThisFileDirectory)config\dynamictint.hpp" />
++    <ClInclude Include="$(MSBuildThisFileDirectory)config\dynamictintpanel.hpp" />
+     <ClInclude Include="$(MSBuildThisFileDirectory)config\config.hpp" />
+     <ClInclude Include="$(MSBuildThisFileDirectory)config\optionaltaskbarappearance.hpp" />
+     <ClInclude Include="$(MSBuildThisFileDirectory)config\rapidjsonhelper.hpp" />
+diff --git a/Common/config/config.hpp b/Common/config/config.hpp
+--- a/Common/config/config.hpp
++++ b/Common/config/config.hpp
+@@ -10,6 +10,7 @@
+ #include "rapidjsonhelper.hpp"
+ #include "ruledtaskbarappearance.hpp"
+ #include "taskbarappearance.hpp"
++#include "dynamictint.hpp"
+ #include "../win32.hpp"
+ #include "windowfilter.hpp"
+ 
+@@ -53,6 +54,7 @@
+ 	std::wstring Language;
+ 	std::optional<bool> UseXamlContextMenu;
+ 	std::optional<bool> CopyDlls;
++	DynamicTintConfig DynamicTint;
+ 
+ 	template<class Writer>
+ 	inline void Serialize(Writer &writer) const
+@@ -74,6 +76,7 @@
+ 		}
+ 		rjh::Serialize(writer, UseXamlContextMenu, USE_XAML_CONTEXT_MENU_KEY);
+ 		rjh::Serialize(writer, CopyDlls, COPY_DLLS_KEY);
++		rjh::Serialize(writer, DynamicTint, DYNAMIC_TINT_KEY);
+ 	}
+ 
+ 	inline void Deserialize(const rjh::value_t &obj, void (*unknownKeyCallback)(std::wstring_view) = nullptr)
+@@ -124,6 +127,10 @@
+ 			else if (key == SAVING_KEY)
+ 			{
+ 				rjh::Deserialize(it->value, DisableSaving, key);
++			}
++			else if (key == DYNAMIC_TINT_KEY)
++			{
++				DynamicTint.Deserialize(it->value, unknownKeyCallback);
+ 			}
+ 			else if (key == LOG_KEY)
+ 			{
+@@ -185,4 +192,5 @@
+ 	static constexpr std::wstring_view LANGUAGE_KEY = L"language";
+ 	static constexpr std::wstring_view USE_XAML_CONTEXT_MENU_KEY = L"use_xaml_context_menu";
+ 	static constexpr std::wstring_view COPY_DLLS_KEY = L"copy_dlls";
++	static constexpr std::wstring_view DYNAMIC_TINT_KEY = L"dynamic_tint";
+ };
+diff --git a/Common/config/dynamictint.hpp b/Common/config/dynamictint.hpp
+new file mode 100644
+--- /dev/null
++++ b/Common/config/dynamictint.hpp
+@@ -0,0 +1,281 @@
++﻿#pragma once
++#include "../arch.h"
++#include <algorithm>
++#include <cmath>
++#include <format>
++#include <string_view>
++
++#if __has_include(<rapidjson/rapidjson.h>)
++#define HAS_RAPIDJSON
++#include <rapidjson/document.h>
++#include "rapidjsonhelper.hpp"
++#endif
++
++// Settings for the dynamic taskbar tint: instead of a fixed acrylic colour, the
++// tint follows the dominant colour of the content behind the taskbar.
++struct DynamicTintConfig {
++	bool Enabled = false;
++	bool AdaptiveSampling = true;
++	bool OnlyFullscreen = false;
++
++	// Sampling rate, clamped to [1, 60].
++	int SamplesPerSecond = 30;
++
++	// Animation rate of the bar itself. Rendering faster than sampling makes
++	// short fades look smooth without sampling the screen more often.
++	int Fps = 60;
++
++	// How much of the way to the target colour we move each frame, 0..1.
++	// Lower is smoother but laggier; 0.18 at 30 fps settles in about 300 ms.
++	float Smoothing = 0.10f;
++
++	// Minimum milliseconds between screen samples. 0 = sample on every tick
++	// (keeps the tint perfectly in sync; filtering handles flicker instead).
++	int SampleInterval = 0;
++
++	// Median window over the last N samples (1 = off, odd numbers preferred).
++	// A median ignores single-frame flashes and scene cuts far better than a
++	// plain moving average, which is what makes video content flicker.
++	int MedianWindow = 5;
++
++	// Ignore colour changes smaller than this (sum of RGB deltas) to stop the
++	// bar from chasing sensor noise.
++	int Deadband = 3;
++
++	// A change larger than this is treated as a scene cut: the temporal filter
++	// is bypassed and the bar transitions with cut_smoothing instead, so cuts
++	// feel immediate while in-scene flicker stays filtered.
++	int CutThreshold = 50;
++
++	// Scene-sized changes must hold this long before being accepted (window
++	// animations change every frame and never stabilise). Gradual changes below
++	// cut_threshold bypass this and are followed in real time.
++	int StabilityMs = 120;
++
++	// A scene-cut candidate that persists this long is accepted even if it
++	// never quite stabilised.
++	int FailsafeMs = 600;
++
++
++	// Duration of the eased transition used for scene cuts. A fixed-duration
++	// smoothstep is both fast and smooth: it advances evenly and lands exactly
++	// on the target, unlike an exponential approach that drags a long tail.
++	int CutDurationMs = 220;
++
++	// Tint brightness is clamped into this range so the bar never becomes a
++	// glaring pastel or an unreadable black slab.
++	float MinValue = 0.12f;
++	float MaxValue = 0.50f;
++
++	// Slight saturation boost so washed-out content still produces a tint.
++	float SaturationBoost = 1.20f;
++
++	// Alpha (0-255) of the acrylic tint.
++	uint8_t Alpha = 168;
++
++	// How deep (in pixels) the sampled area reaches into the screen, measured
++	// from the taskbar edge. 0 means "auto": the nearest 1/pi of the visible
++	// area, which keeps the colour tied to what is next to the bar without
++	// ignoring the rest of the frame.
++	int SampleDepth = 0;
++
++	// Vertical weighting: rows next to the taskbar count more than rows further
++	// away. 0 = flat (whole area equally), 1 = only the first row matters.
++	float NearBias = 0.95f;
++	int SampleWidth = 96;
++
++	// Number of independent colour zones across the bar. 1 = single acrylic
++	// colour, 2+ = horizontal gradient built from that many samples.
++	int Zones = 20;
++
++	static constexpr std::wstring_view ADAPTIVE_KEY = L"adaptive_sampling";
++	static constexpr std::wstring_view ENABLED_KEY = L"enabled";
++	static constexpr std::wstring_view ONLY_FULLSCREEN_KEY = L"only_fullscreen";
++	static constexpr std::wstring_view SAMPLES_PER_SECOND_KEY = L"samples_per_second";
++	static constexpr std::wstring_view FPS_KEY = L"fps";
++	static constexpr std::wstring_view SMOOTHING_KEY = L"smoothing";
++	static constexpr std::wstring_view MIN_VALUE_KEY = L"min_value";
++	static constexpr std::wstring_view MAX_VALUE_KEY = L"max_value";
++	static constexpr std::wstring_view SATURATION_BOOST_KEY = L"saturation_boost";
++	static constexpr std::wstring_view ALPHA_KEY = L"alpha";
++	static constexpr std::wstring_view SAMPLE_DEPTH_KEY = L"sample_depth";
++	static constexpr std::wstring_view SAMPLE_WIDTH_KEY = L"sample_width";
++	static constexpr std::wstring_view ZONES_KEY = L"zones";
++	static constexpr std::wstring_view NEAR_BIAS_KEY = L"near_bias";
++	static constexpr std::wstring_view SAMPLE_INTERVAL_KEY = L"sample_interval";
++	static constexpr std::wstring_view MEDIAN_WINDOW_KEY = L"median_window";
++	static constexpr std::wstring_view DEADBAND_KEY = L"deadband";
++	static constexpr std::wstring_view CUT_THRESHOLD_KEY = L"cut_threshold";
++	static constexpr std::wstring_view CUT_DURATION_KEY = L"cut_duration_ms";
++	static constexpr std::wstring_view STABILITY_KEY = L"stability_ms";
++	static constexpr std::wstring_view FAILSAFE_KEY = L"failsafe_ms";
++
++	inline void Clamp() noexcept
++	{
++		SamplesPerSecond = std::clamp(SamplesPerSecond, 1, 60);
++		Fps = std::clamp(Fps, 20, 120);
++		Smoothing = std::clamp(Smoothing, 0.01f, 1.0f);
++		MinValue = std::clamp(MinValue, 0.0f, 1.0f);
++		MaxValue = std::clamp(MaxValue, MinValue, 1.0f);
++		SaturationBoost = std::clamp(SaturationBoost, 0.0f, 4.0f);
++		SampleDepth = std::clamp(SampleDepth, 0, 4096);
++		NearBias = std::clamp(NearBias, 0.0f, 1.0f);
++		SampleInterval = std::clamp(SampleInterval, 0, 1000);
++		MedianWindow = std::clamp(MedianWindow, 1, 9);
++		Deadband = std::clamp(Deadband, 0, 60);
++		CutThreshold = std::clamp(CutThreshold, 0, 765);
++		CutDurationMs = std::clamp(CutDurationMs, 40, 2000);
++		StabilityMs = std::clamp(StabilityMs, 0, 5000);
++		FailsafeMs = std::clamp(FailsafeMs, 0, 10000);
++		SampleWidth = std::clamp(SampleWidth, 4, 512);
++		Zones = std::clamp(Zones, 1, 32);
++	}
++
++#ifdef HAS_RAPIDJSON
++	template<class Writer>
++	inline void Serialize(Writer &writer) const
++	{
++		rjh::Serialize(writer, Enabled, ENABLED_KEY);
++		rjh::Serialize(writer, AdaptiveSampling, ADAPTIVE_KEY);
++		rjh::Serialize(writer, OnlyFullscreen, ONLY_FULLSCREEN_KEY);
++		rjh::Serialize(writer, static_cast<float>(SamplesPerSecond), SAMPLES_PER_SECOND_KEY);
++		rjh::Serialize(writer, static_cast<float>(Fps), FPS_KEY);
++		rjh::Serialize(writer, Smoothing, SMOOTHING_KEY);
++		rjh::Serialize(writer, MinValue, MIN_VALUE_KEY);
++		rjh::Serialize(writer, MaxValue, MAX_VALUE_KEY);
++		rjh::Serialize(writer, SaturationBoost, SATURATION_BOOST_KEY);
++		rjh::Serialize(writer, static_cast<float>(Alpha), ALPHA_KEY);
++		rjh::Serialize(writer, static_cast<float>(SampleDepth), SAMPLE_DEPTH_KEY);
++		rjh::Serialize(writer, static_cast<float>(SampleWidth), SAMPLE_WIDTH_KEY);
++		rjh::Serialize(writer, static_cast<float>(Zones), ZONES_KEY);
++		rjh::Serialize(writer, NearBias, NEAR_BIAS_KEY);
++		rjh::Serialize(writer, static_cast<float>(SampleInterval), SAMPLE_INTERVAL_KEY);
++		rjh::Serialize(writer, static_cast<float>(MedianWindow), MEDIAN_WINDOW_KEY);
++		rjh::Serialize(writer, static_cast<float>(Deadband), DEADBAND_KEY);
++		rjh::Serialize(writer, static_cast<float>(CutThreshold), CUT_THRESHOLD_KEY);
++		rjh::Serialize(writer, static_cast<float>(CutDurationMs), CUT_DURATION_KEY);
++		rjh::Serialize(writer, static_cast<float>(StabilityMs), STABILITY_KEY);
++		rjh::Serialize(writer, static_cast<float>(FailsafeMs), FAILSAFE_KEY);
++	}
++
++	void Deserialize(const rjh::value_t &obj, void (*unknownKeyCallback)(std::wstring_view))
++	{
++		rjh::EnsureType(rj::Type::kObjectType, obj.GetType(), L"root node");
++
++		for (auto it = obj.MemberBegin(); it != obj.MemberEnd(); ++it)
++		{
++			rjh::EnsureType(rj::Type::kStringType, it->name.GetType(), L"member name");
++
++			const auto key = rjh::ValueToStringView(it->name);
++			if (key == ENABLED_KEY)
++			{
++				rjh::Deserialize(it->value, Enabled, key);
++			}
++			else if (key == ADAPTIVE_KEY)
++			{
++				rjh::Deserialize(it->value, AdaptiveSampling, key);
++			}
++			else if (key == ONLY_FULLSCREEN_KEY)
++			{
++				rjh::Deserialize(it->value, OnlyFullscreen, key);
++			}
++			else if (key == SAMPLES_PER_SECOND_KEY)
++			{
++				SamplesPerSecond = ReadInt(it->value, key);
++			}
++			else if (key == FPS_KEY)
++			{
++				Fps = ReadInt(it->value, key);
++			}
++			else if (key == SMOOTHING_KEY)
++			{
++				rjh::Deserialize(it->value, Smoothing, key);
++			}
++			else if (key == MIN_VALUE_KEY)
++			{
++				rjh::Deserialize(it->value, MinValue, key);
++			}
++			else if (key == MAX_VALUE_KEY)
++			{
++				rjh::Deserialize(it->value, MaxValue, key);
++			}
++			else if (key == SATURATION_BOOST_KEY)
++			{
++				rjh::Deserialize(it->value, SaturationBoost, key);
++			}
++			else if (key == ALPHA_KEY)
++			{
++				Alpha = static_cast<uint8_t>(std::clamp(ReadInt(it->value, key), 0, 255));
++			}
++			else if (key == SAMPLE_DEPTH_KEY)
++			{
++				SampleDepth = ReadInt(it->value, key);
++			}
++			else if (key == SAMPLE_WIDTH_KEY)
++			{
++				SampleWidth = ReadInt(it->value, key);
++			}
++			else if (key == ZONES_KEY)
++			{
++				Zones = ReadInt(it->value, key);
++			}
++			else if (key == NEAR_BIAS_KEY)
++			{
++				rjh::Deserialize(it->value, NearBias, key);
++			}
++			else if (key == SAMPLE_INTERVAL_KEY)
++			{
++				SampleInterval = ReadInt(it->value, key);
++			}
++			else if (key == MEDIAN_WINDOW_KEY)
++			{
++				MedianWindow = ReadInt(it->value, key);
++			}
++			else if (key == DEADBAND_KEY)
++			{
++				Deadband = ReadInt(it->value, key);
++			}
++			else if (key == CUT_THRESHOLD_KEY)
++			{
++				CutThreshold = ReadInt(it->value, key);
++			}
++			else if (key == CUT_DURATION_KEY)
++			{
++				CutDurationMs = ReadInt(it->value, key);
++			}
++			else if (key == STABILITY_KEY)
++			{
++				StabilityMs = ReadInt(it->value, key);
++			}
++			else if (key == FAILSAFE_KEY)
++			{
++				FailsafeMs = ReadInt(it->value, key);
++			}
++			else if (unknownKeyCallback)
++			{
++				unknownKeyCallback(key);
++			}
++		}
++
++		Clamp();
++	}
++
++private:
++	static inline int ReadInt(const rjh::value_t &value, std::wstring_view key)
++	{
++		rjh::EnsureType(rj::Type::kNumberType, value.GetType(), key);
++
++		// The app itself writes these fields back as doubles ("fps": 120.0), so
++		// require an integer only loosely: accept any JSON number and round.
++		if (value.IsInt())
++		{
++			return value.GetInt();
++		}
++		if (value.IsUint())
++		{
++			return static_cast<int>(value.GetUint());
++		}
++		return static_cast<int>(std::lround(value.GetDouble()));
++	}
++#endif
++};
+\ No newline at end of file
+diff --git a/Common/config/dynamictintpanel.hpp b/Common/config/dynamictintpanel.hpp
+new file mode 100644
+--- /dev/null
++++ b/Common/config/dynamictintpanel.hpp
+@@ -0,0 +1,16 @@
++#pragma once
++#include "dynamictint.hpp"
++
++// Applies only the controls exposed by the optional parameter panel. Enabling
++// the feature and all original TranslucentTB appearance rules are preserved.
++inline void ApplyDynamicTintPanelSettings(DynamicTintConfig &tint, int zones, int fps, int samplesPerSecond, int sampleDepth, bool adaptiveSampling = true) noexcept
++{
++    tint.AdaptiveSampling = adaptiveSampling;
++    tint.Zones = zones;
++    tint.Fps = fps;
++    tint.SamplesPerSecond = samplesPerSecond;
++    tint.SampleDepth = sampleDepth;
++    // The frequency control takes precedence over the legacy interval option.
++    tint.SampleInterval = 0;
++    tint.Clamp();
++}
+diff --git a/Common/util/dynamictintschedule.hpp b/Common/util/dynamictintschedule.hpp
+new file mode 100644
+--- /dev/null
++++ b/Common/util/dynamictintschedule.hpp
+@@ -0,0 +1,46 @@
++#pragma once
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <limits>
++
++// Main-thread-only policy. Absolute deadlines prevent frequent input/layout
++// events from postponing a capture forever. No Windows input data is retained.
++class DynamicTintSchedule {
++    using Tick = std::uint64_t;
++    static constexpr Tick Never = std::numeric_limits<Tick>::max();
++    static constexpr std::array<Tick, 6> RetryDelays {120, 300, 800, 1600, 3200, 6000};
++    Tick m_Last = 0, m_Hint = Never, m_Startup = 0, m_MotionUntil = 0;
++    std::size_t m_Retry = RetryDelays.size();
++    unsigned m_Stable = 0;
++    bool m_HasSample = false;
++public:
++    void Reset() noexcept { *this = {}; }
++    void Activity(Tick now) noexcept { m_Hint = std::min(m_Hint, now + 100); }
++    void Startup(Tick now) noexcept { m_Startup = now; m_Retry = 0; Activity(now); }
++    unsigned Delay(Tick now, unsigned requestedMs, bool adaptive) const noexcept
++    {
++        if (!m_HasSample) return 0;
++        const Tick interval = std::max(1u, requestedMs);
++        Tick due = m_Last + interval;
++        if (adaptive)
++        {
++            due = m_Last + std::max<Tick>(500, interval);
++            if (now < m_MotionUntil) due = std::min(due, m_Last + std::max<Tick>(50, interval));
++            const Tick eventGap = m_Last + std::max<Tick>(80, interval);
++            if (m_Hint != Never) due = std::min(due, std::max(m_Hint, eventGap));
++            if (m_Retry < RetryDelays.size()) due = std::min(due, std::max(m_Startup + RetryDelays[m_Retry], eventGap));
++        }
++        return due <= now ? 0 : static_cast<unsigned>(std::min<Tick>(due - now, 1000));
++    }
++    bool Due(Tick now, unsigned interval, bool adaptive) const noexcept { return Delay(now, interval, adaptive) == 0; }
++    void Sampled(Tick now, bool changed) noexcept
++    {
++        m_HasSample = true;
++        m_Last = now;
++        if (m_Hint <= now) m_Hint = Never;
++        while (m_Retry < RetryDelays.size() && m_Startup + RetryDelays[m_Retry] <= now) ++m_Retry;
++        if (changed) { m_MotionUntil = now + 1000; m_Stable = 0; }
++        else if (++m_Stable >= 3) m_MotionUntil = 0;
++    }
++};
+diff --git a/ExplorerTAP/ITaskbarAppearanceService.idl b/ExplorerTAP/ITaskbarAppearanceService.idl
+--- a/ExplorerTAP/ITaskbarAppearanceService.idl
++++ b/ExplorerTAP/ITaskbarAppearanceService.idl
+@@ -14,4 +14,8 @@
+ 	HRESULT RestoreAllTaskbarsToDefaultWhenProcessDies([in] DWORD pid);
+ 
+ 	HRESULT KillExplorerWhenPackageUninstalls([in, string] LPCWSTR packageFullName);
++
++	// Appended methods must stay at the end: existing consumers resolve the
++	// interface by vtable order.
++	HRESULT SetTaskbarGradient([in] HWND taskbar, [in] UINT count, [in, size_is(count)] UINT *colors, [in, size_is(count)] FLOAT *offsets);
+ };
+diff --git a/ExplorerTAP/taskbarappearanceservice.cpp b/ExplorerTAP/taskbarappearanceservice.cpp
+--- a/ExplorerTAP/taskbarappearanceservice.cpp
++++ b/ExplorerTAP/taskbarappearanceservice.cpp
+@@ -1,4 +1,6 @@
+-#include "taskbarappearanceservice.hpp"
++﻿#include "taskbarappearanceservice.hpp"
++#include <algorithm>
++#include <winrt/Windows.Foundation.Collections.h>
+ #include <RpcProxy.h>
+ #include <shellapi.h>
+ #include <wil/cppwinrt_helpers.h>
+@@ -64,7 +66,70 @@
+ 				newBrush = std::move(solidBrush);
+ 			}
+ 
++			m_GradientBrushes.erase(taskbar);
++			m_GradientStopCounts.erase(taskbar);
++			m_ApplyingFill = true;
+ 			info->background.control.Fill(newBrush);
++			m_ApplyingFill = false;
++		}
++	}
++
++	return S_OK;
++}
++catch (...)
++{
++	return winrt::to_hresult();
++}
++
++HRESULT TaskbarAppearanceService::SetTaskbarGradient(HWND taskbar, UINT count, UINT *colors, FLOAT *offsets) try
++{
++	if (!colors || !offsets || count < 2)
++	{
++		return E_INVALIDARG;
++	}
++
++	if (const auto info = GetTaskbarInfo(taskbar))
++	{
++		if (info->background.control && info->background.originalFill)
++		{
++			// A single horizontal gradient brush gives us an "ambient light" bar:
++			// each sampled zone becomes a colour stop and XAML interpolates
++			// smoothly between them.
++			//
++			// The brush is created once and then mutated in place: re-assigning a
++			// brand new brush 30 times per second forces the compositor to
++			// recomposite the bar and shows up as flicker on video content.
++			auto &cachedBrush = m_GradientBrushes[taskbar];
++			auto &cachedStops = m_GradientStopCounts[taskbar];
++			if (!cachedBrush || cachedStops != count)
++			{
++				wux::Media::LinearGradientBrush brush;
++				brush.StartPoint({ 0.0f, 0.5f });
++				brush.EndPoint({ 1.0f, 0.5f });
++
++				auto stops = brush.GradientStops();
++				for (UINT i = 0; i < count; ++i)
++				{
++					wux::Media::GradientStop stop;
++					stop.Color(Util::Color::FromABGR(colors[i]));
++					stop.Offset(std::clamp(offsets[i], 0.0f, 1.0f));
++					stops.Append(stop);
++				}
++
++				cachedBrush = brush;
++				cachedStops = count;
++				m_ApplyingFill = true;
++				info->background.control.Fill(brush);
++				m_ApplyingFill = false;
++			}
++			else
++			{
++				auto stops = cachedBrush.GradientStops();
++				for (UINT i = 0; i < count; ++i)
++				{
++					stops.GetAt(i).Color(Util::Color::FromABGR(colors[i]));
++				}
++			}
+ 		}
+ 	}
+ 
+@@ -90,7 +155,11 @@
+ 			};
+ 
+ 			auto compositor = wuxh::ElementCompositionPreview::GetElementVisual(info->background.control).Compositor();
++			m_GradientBrushes.erase(taskbar);
++			m_GradientStopCounts.erase(taskbar);
++			m_ApplyingFill = true;
+ 			info->background.control.Fill(winrt::make<XamlBlurBrush>(std::move(compositor), blurAmount, tintHdr));
++			m_ApplyingFill = false;
+ 		}
+ 	}
+ 
+@@ -103,10 +172,12 @@
+ 
+ HRESULT TaskbarAppearanceService::ReturnTaskbarToDefaultAppearance(HWND taskbar) try
+ {
+-	for (const auto& [handle, info] : m_Taskbars)
++	for (auto& [handle, info] : m_Taskbars)
+ 	{
+ 		if (GetAncestor(info.window, GA_PARENT) == taskbar)
+ 		{
++			m_GradientBrushes.erase(taskbar);
++			m_GradientStopCounts.erase(taskbar);
+ 			RestoreDefaultControlFill(info.background);
+ 			break;
+ 		}
+@@ -152,6 +223,11 @@
+ 
+ HRESULT TaskbarAppearanceService::RestoreAllTaskbarsToDefault() try
+ {
++	// Disable the shell Fill callback's gradient replay before restoring Fill.
++	// Both normal shutdown and process-death recovery use this path.
++	m_GradientBrushes.clear();
++	m_GradientStopCounts.clear();
++
+ 	for (const auto& [handle, info] : m_Taskbars)
+ 	{
+ 		RestoreDefaultControlFill(info.background);
+@@ -370,11 +446,31 @@
+ 
+ void TaskbarAppearanceService::OnTaskbarBackgroundUpdated(const wux::DependencyObject &sender, const wux::DependencyProperty&)
+ {
++	if (m_ApplyingFill)
++	{
++		return;
++	}
++
+ 	for (auto& [handle, info] : m_Taskbars)
+ 	{
+-		if (sender == info.background.control && !info.background.originalFill)
+-		{
+-			info.background.originalFill = info.background.control.Fill();
++		if (sender == info.background.control)
++		{
++			if (!info.background.originalFill)
++			{
++				info.background.originalFill = info.background.control.Fill();
++			}
++
++			// The shell rewrites the bar's Fill on events like opening a
++			// thumbnail flyout. Restore our cached gradient right here instead
++			// of waiting for the next sample tick, otherwise the bar flashes
++			// back to its stock look for a frame.
++			const HWND taskbar = GetAncestor(info.window, GA_PARENT);
++			if (const auto brush = m_GradientBrushes.find(taskbar); brush != m_GradientBrushes.end() && brush->second)
++			{
++				m_ApplyingFill = true;
++				info.background.control.Fill(brush->second);
++				m_ApplyingFill = false;
++			}
+ 		}
+ 	}
+ }
+diff --git a/ExplorerTAP/taskbarappearanceservice.hpp b/ExplorerTAP/taskbarappearanceservice.hpp
+--- a/ExplorerTAP/taskbarappearanceservice.hpp
++++ b/ExplorerTAP/taskbarappearanceservice.hpp
+@@ -1,4 +1,4 @@
+-#pragma once
++﻿#pragma once
+ #include <optional>
+ #include <unordered_map>
+ #include <xamlOM.h>
+@@ -29,6 +29,7 @@
+ 	HRESULT STDMETHODCALLTYPE GetVersion(DWORD* apiVersion) noexcept override;
+ 
+ 	HRESULT STDMETHODCALLTYPE SetTaskbarAppearance(HWND taskbar, TaskbarBrush brush, UINT color) override;
++	HRESULT STDMETHODCALLTYPE SetTaskbarGradient(HWND taskbar, UINT count, UINT *colors, FLOAT *offsets) override;
+ 	HRESULT STDMETHODCALLTYPE SetTaskbarBlur(HWND taskbar, UINT color, FLOAT blurAmount) override;
+ 	HRESULT STDMETHODCALLTYPE ReturnTaskbarToDefaultAppearance(HWND taskbar) override;
+ 
+@@ -69,6 +70,12 @@
+ 	void OnPackageUpdating(const wam::PackageCatalog &catalog, const wam::PackageUpdatingEventArgs &args);
+ 	std::optional<TaskbarInfo> GetTaskbarInfo(HWND taskbar);
+ 
++	// Cached gradient brushes: recreating one every frame forces the compositor
++	// to recomposite the bar, which reads as flicker on video content.
++	std::unordered_map<HWND, wux::Media::LinearGradientBrush> m_GradientBrushes;
++	std::unordered_map<HWND, UINT> m_GradientStopCounts;
++	bool m_ApplyingFill = false;
++
+ 	void OnTaskbarBackgroundUpdated(const wux::DependencyObject &sender, const wux::DependencyProperty &dp);
+ 	void OnTaskbarBorderUpdated(const wux::DependencyObject &sender, const wux::DependencyProperty &dp);
+ 
+diff --git a/Tests/Tests.vcxproj b/Tests/Tests.vcxproj
+--- a/Tests/Tests.vcxproj
++++ b/Tests/Tests.vcxproj
+@@ -21,12 +21,16 @@
+       <DisableSpecificWarnings>4275;4389;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+     </ClCompile>
+     <Link>
+-      <AdditionalDependencies>gmock_main.lib;ole32.lib;oleaut32.lib;runtimeobject.lib;version.lib;%(AdditionalDependencies)</AdditionalDependencies>
++      <AdditionalDependencies>gdi32.lib;gmock_main.lib;ole32.lib;oleaut32.lib;runtimeobject.lib;version.lib;%(AdditionalDependencies)</AdditionalDependencies>
+       <SubSystem>Console</SubSystem>
+       <GenerateDebugInformation>DebugFull</GenerateDebugInformation>
+     </Link>
+   </ItemDefinitionGroup>
+   <ItemGroup>
++    <ClCompile Include="config\capturebuffer.cpp" />
++    <ClCompile Include="..\TranslucentTB\taskbar\dynamictint.cpp" />
++    <ClCompile Include="config\dynamictintschedule.cpp" />
++    <ClCompile Include="config\dynamictintpanel.cpp" />
+     <ClCompile Include="config\rapidjsonhelper.cpp" />
+     <ClCompile Include="util\color.cpp" />
+     <ClCompile Include="util\numbers.cpp" />
+diff --git a/Tests/Tests.vcxproj.filters b/Tests/Tests.vcxproj.filters
+--- a/Tests/Tests.vcxproj.filters
++++ b/Tests/Tests.vcxproj.filters
+@@ -19,6 +19,12 @@
+     <ClCompile Include="util\color.cpp">
+       <Filter>Util Tests</Filter>
+     </ClCompile>
++    <ClCompile Include="config\capturebuffer.cpp"><Filter>Config Tests</Filter></ClCompile>
++    <ClCompile Include="..\TranslucentTB\taskbar\dynamictint.cpp" />
++    <ClCompile Include="config\dynamictintschedule.cpp"><Filter>Config Tests</Filter></ClCompile>
++    <ClCompile Include="config\dynamictintpanel.cpp">
++      <Filter>Config Tests</Filter>
++    </ClCompile>
+     <ClCompile Include="config\rapidjsonhelper.cpp">
+       <Filter>Config Tests</Filter>
+     </ClCompile>
+diff --git a/Tests/config/capturebuffer.cpp b/Tests/config/capturebuffer.cpp
+new file mode 100644
+--- /dev/null
++++ b/Tests/config/capturebuffer.cpp
+@@ -0,0 +1,28 @@
++#include <gtest/gtest.h>
++#include <Windows.h>
++#include "../../TranslucentTB/taskbar/dynamictint.hpp"
++
++TEST(DynamicTintCapture, ReusesBitmapAcrossRepeatedCaptures)
++{
++    const RECT band {0, 0, 512, 16};
++    if (DynamicTint::SampleBandZones(band, 16, 12, 0.95f).empty()) GTEST_SKIP() << "Interactive desktop capture unavailable";
++    const auto allocations = DynamicTint::CaptureAllocationCount();
++    const auto resources = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
++    for (int i = 0; i < 100; ++i)
++        ASSERT_EQ(DynamicTint::SampleBandZones(band, 16, 12, 0.95f).size(), 16u);
++    EXPECT_EQ(DynamicTint::CaptureAllocationCount(), allocations);
++    EXPECT_LE(GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS), resources + 1);
++}
++TEST(DynamicTintCapture, ResizingAndSingleZonePathsDoNotLeakGdiObjects)
++{
++    const RECT band {0, 0, 512, 16};
++    if (DynamicTint::SampleBandZones(band, 16, 12, 0.95f).empty()) GTEST_SKIP() << "Interactive desktop capture unavailable";
++    const auto resources = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
++    for (int i = 0; i < 50; ++i)
++    {
++        ASSERT_EQ(DynamicTint::SampleBandZones(band, 8, 12, 0.95f).size(), 8u);
++        ASSERT_TRUE(DynamicTint::SampleBand(band, 96, 12, 0.95f).has_value());
++        ASSERT_EQ(DynamicTint::SampleBandZones(band, 20, 12, 0.95f).size(), 20u);
++    }
++    EXPECT_LE(GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS), resources + 1);
++}
+diff --git a/Tests/config/dynamictintpanel.cpp b/Tests/config/dynamictintpanel.cpp
+new file mode 100644
+--- /dev/null
++++ b/Tests/config/dynamictintpanel.cpp
+@@ -0,0 +1,49 @@
++#include <gtest/gtest.h>
++#include "config/dynamictintpanel.hpp"
++
++TEST(DynamicTintPanel, FrequencyControlReplacesLegacyInterval)
++{
++    DynamicTintConfig tint;
++    tint.SampleInterval = 500;
++    ApplyDynamicTintPanelSettings(tint, 12, 75, 45, 160);
++    EXPECT_EQ(tint.SampleInterval, 0);
++    EXPECT_EQ(tint.Zones, 12);
++    EXPECT_EQ(tint.Fps, 75);
++    EXPECT_EQ(tint.SamplesPerSecond, 45);
++    EXPECT_EQ(tint.SampleDepth, 160);
++}
++
++TEST(DynamicTintPanel, EditingParametersPreservesEnableStateAndAppearanceOptions)
++{
++    for (bool enabled : {false, true})
++    {
++        DynamicTintConfig tint;
++        tint.Enabled = enabled;
++        tint.OnlyFullscreen = true;
++        tint.Alpha = 211;
++        tint.NearBias = 0.8f;
++        tint.CutDurationMs = 300;
++        ApplyDynamicTintPanelSettings(tint, 1, 20, 1, 0);
++        EXPECT_EQ(tint.Enabled, enabled);
++        EXPECT_TRUE(tint.OnlyFullscreen);
++        EXPECT_EQ(tint.Alpha, 211);
++        EXPECT_FLOAT_EQ(tint.NearBias, 0.8f);
++        EXPECT_EQ(tint.CutDurationMs, 300);
++        EXPECT_EQ(tint.SampleDepth, 0); // Auto remains a valid choice.
++    }
++}
++
++TEST(DynamicTintPanel, NonUiCallersStillReceiveBoundedParameters)
++{
++    DynamicTintConfig tint;
++    ApplyDynamicTintPanelSettings(tint, -1, -1, -1, -1);
++    EXPECT_EQ(tint.Zones, 1);
++    EXPECT_EQ(tint.Fps, 20);
++    EXPECT_EQ(tint.SamplesPerSecond, 1);
++    EXPECT_EQ(tint.SampleDepth, 0);
++    ApplyDynamicTintPanelSettings(tint, 10000, 10000, 10000, 10000);
++    EXPECT_EQ(tint.Zones, 32);
++    EXPECT_EQ(tint.Fps, 120);
++    EXPECT_EQ(tint.SamplesPerSecond, 60);
++    EXPECT_EQ(tint.SampleDepth, 4096);
++}
+diff --git a/Tests/config/dynamictintschedule.cpp b/Tests/config/dynamictintschedule.cpp
+new file mode 100644
+--- /dev/null
++++ b/Tests/config/dynamictintschedule.cpp
+@@ -0,0 +1,99 @@
++#include <gtest/gtest.h>
++#include "util/dynamictintschedule.hpp"
++#include "config/dynamictintpanel.hpp"
++
++TEST(DynamicTintSchedule, FirstCaptureIsImmediate)
++{
++    DynamicTintSchedule s;
++    EXPECT_TRUE(s.Due(1000, 25, true));
++}
++TEST(DynamicTintSchedule, StaticSceneHasHalfSecondFallback)
++{
++    DynamicTintSchedule s;
++    s.Sampled(1000, false);
++    EXPECT_EQ(s.Delay(1000, 25, true), 500u);
++    EXPECT_FALSE(s.Due(1499, 25, true));
++    EXPECT_TRUE(s.Due(1500, 25, true));
++}
++TEST(DynamicTintSchedule, RepeatedInputCannotPostponePendingCapture)
++{
++    DynamicTintSchedule s;
++    s.Sampled(1000, false);
++    s.Activity(1010);
++    s.Activity(1060);
++    s.Activity(1100);
++    EXPECT_EQ(s.Delay(1100, 25, true), 10u);
++    EXPECT_TRUE(s.Due(1110, 25, true));
++}
++TEST(DynamicTintSchedule, MotionIsLimitedToTwentyHzAndStopsAfterStableCaptures)
++{
++    DynamicTintSchedule s;
++    s.Sampled(1000, true);
++    EXPECT_EQ(s.Delay(1000, 8, true), 50u);
++    s.Sampled(1050, false);
++    s.Sampled(1100, false);
++    s.Sampled(1150, false);
++    EXPECT_EQ(s.Delay(1150, 8, true), 500u);
++}
++TEST(DynamicTintSchedule, ActivityRespectsLowConfiguredRate)
++{
++    DynamicTintSchedule s;
++    s.Sampled(1000, true);
++    s.Activity(1010);
++    EXPECT_FALSE(s.Due(1500, 1000, true));
++    EXPECT_TRUE(s.Due(2000, 1000, true));
++}
++TEST(DynamicTintSchedule, ContinuousModePreservesSamplingInterval)
++{
++    DynamicTintSchedule s;
++    s.Sampled(1000, false);
++    EXPECT_EQ(s.Delay(1000, 25, false), 25u);
++    EXPECT_FALSE(s.Due(1024, 25, false));
++    EXPECT_TRUE(s.Due(1025, 25, false));
++}
++TEST(DynamicTintSchedule, SlowStartupRetainsLateRetries)
++{
++    DynamicTintSchedule s;
++    s.Sampled(1000, false);
++    s.Startup(1000);
++    s.Sampled(1100, false);
++    s.Sampled(1200, false);
++    s.Sampled(1400, false);
++    s.Sampled(1800, false);
++    s.Sampled(2600, false);
++    s.Sampled(4100, false);
++    EXPECT_EQ(s.Delay(4100, 25, true), 100u); // 3200 ms retry
++    s.Sampled(4200, false);
++    s.Sampled(6900, false);
++    EXPECT_EQ(s.Delay(6900, 25, true), 100u); // 6000 ms retry
++    s.Sampled(7000, false);
++    EXPECT_EQ(s.Delay(7000, 25, true), 500u);
++}
++TEST(DynamicTintSchedule, ResetRequestsFreshCapture)
++{
++    DynamicTintSchedule s;
++    s.Sampled(1000, false);
++    s.Reset();
++    EXPECT_TRUE(s.Due(1001, 25, true));
++}
++TEST(DynamicTintPanel, ModeSelectionDoesNotEnableFeature)
++{
++    DynamicTintConfig tint;
++    ApplyDynamicTintPanelSettings(tint, 16, 120, 40, 0, false);
++    EXPECT_FALSE(tint.AdaptiveSampling);
++    EXPECT_FALSE(tint.Enabled);
++    ApplyDynamicTintPanelSettings(tint, 16, 120, 40, 0, true);
++    EXPECT_TRUE(tint.AdaptiveSampling);
++    EXPECT_FALSE(tint.Enabled);
++}
++TEST(DynamicTintConfig, OldConfigDefaultsToAdaptiveAndExplicitContinuousLoads)
++{
++    DynamicTintConfig tint;
++    EXPECT_TRUE(tint.AdaptiveSampling);
++    rj::GenericDocument<rj::UTF16LE<>> document;
++    document.Parse(L"{\"enabled\":true,\"adaptive_sampling\":false}");
++    ASSERT_FALSE(document.HasParseError());
++    tint.Deserialize(document, nullptr);
++    EXPECT_TRUE(tint.Enabled);
++    EXPECT_FALSE(tint.AdaptiveSampling);
++}
+diff --git a/TranslucentTB/TranslucentTB.vcxproj b/TranslucentTB/TranslucentTB.vcxproj
+--- a/TranslucentTB/TranslucentTB.vcxproj
++++ b/TranslucentTB/TranslucentTB.vcxproj
+@@ -1,4 +1,4 @@
+-<?xml version="1.0" encoding="utf-8"?>
++﻿<?xml version="1.0" encoding="utf-8"?>
+ <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+   <Import Project="..\packages\Microsoft.Windows.SDK.CPP.x64.10.0.26100.7463\build\native\Microsoft.Windows.SDK.cpp.x64.props" Condition="Exists('..\packages\Microsoft.Windows.SDK.CPP.x64.10.0.26100.7463\build\native\Microsoft.Windows.SDK.cpp.x64.props')" />
+   <Import Project="..\packages\Microsoft.Windows.SDK.CPP.arm64.10.0.26100.7463\build\native\Microsoft.Windows.SDK.cpp.arm64.props" Condition="Exists('..\packages\Microsoft.Windows.SDK.CPP.arm64.10.0.26100.7463\build\native\Microsoft.Windows.SDK.cpp.arm64.props')" />
+@@ -86,6 +86,7 @@
+     <ClCompile Include="mainappwindow.cpp" />
+     <ClCompile Include="managers\startupmanager.cpp" />
+     <ClCompile Include="taskbar\taskbarattributeworker.cpp" />
++    <ClCompile Include="taskbar\dynamictint.cpp" />
+     <ClCompile Include="main.cpp" />
+     <ClCompile Include="tray\basecontextmenu.cpp" />
+     <ClCompile Include="uwp\basexamlpagehost.cpp" />
+@@ -112,6 +113,7 @@
+     <ClInclude Include="tray\basecontextmenu.hpp" />
+     <ClInclude Include="tray\traycontextmenu.hpp" />
+     <ClInclude Include="taskbar\taskbarattributeworker.hpp" />
++    <ClInclude Include="taskbar\dynamictint.hpp" />
+     <ClInclude Include="uwp\basexamlpagehost.hpp" />
+     <ClInclude Include="uwp\dynamicdependency.hpp" />
+     <ClInclude Include="uwp\xamldragregion.hpp" />
+diff --git a/TranslucentTB/mainappwindow.cpp b/TranslucentTB/mainappwindow.cpp
+--- a/TranslucentTB/mainappwindow.cpp
++++ b/TranslucentTB/mainappwindow.cpp
+@@ -2,6 +2,7 @@
+ #include <member_thunk/member_thunk.hpp>
+ 
+ #include "application.hpp"
++#include "config/dynamictintpanel.hpp"
+ #include "constants.hpp"
+ #include "localization.hpp"
+ #include "resources/ids.h"
+@@ -86,6 +87,7 @@
+ 	}
+ 
+ 	trayPage.SetDisableSavingSettings(settings.DisableSaving);
++	trayPage.SetDynamicTintState(settings.DynamicTint.Enabled);
+ 
+ 	trayPage.SetStartupState(m_App.GetStartupManager().GetState());
+ }
+@@ -95,6 +97,8 @@
+ 	const auto &menu = page();
+ 	m_TaskbarSettingsChangedRevoker = menu.TaskbarSettingsChanged(winrt::auto_revoke, { this, &MainAppWindow::TaskbarSettingsChanged });
+ 	m_ColorRequestedRevoker = menu.ColorRequested(winrt::auto_revoke, { this, &MainAppWindow::ColorRequested });
++	m_DynamicTintChangedRevoker = menu.DynamicTintChanged(winrt::auto_revoke, { this, &MainAppWindow::DynamicTintChanged });
++	m_DynamicTintSettingsRequestedRevoker = menu.DynamicTintSettingsRequested(winrt::auto_revoke, { this, &MainAppWindow::DynamicTintSettingsRequested });
+ 
+ 	m_OpenLogFileRequestedRevoker = menu.OpenLogFileRequested(winrt::auto_revoke, { this, &MainAppWindow::OpenLogFileRequested });
+ 	m_LogLevelChangedRevoker = menu.LogLevelChanged(winrt::auto_revoke, { this, &MainAppWindow::LogLevelChanged });
+@@ -134,6 +138,54 @@
+ 	}
+ 
+ 	m_App.GetWorker().ConfigurationChanged();
++}
++
++void MainAppWindow::DynamicTintSettingsRequested()
++{
++	std::unique_lock lock(m_PickerMutex);
++	if (m_DynamicSettingsHost)
++	{
++		SetForegroundWindow(m_DynamicSettingsHost->handle());
++		return;
++	}
++	const auto &tint = m_App.GetConfigManager().GetConfig().DynamicTint;
++	const int samples = tint.SampleInterval > 0 ? std::clamp(1000 / tint.SampleInterval, 1, 60) : tint.SamplesPerSecond;
++	using winrt::TranslucentTB::Xaml::Pages::DynamicTintSettingsPage;
++	m_App.CreateXamlWindow<DynamicTintSettingsPage>(xaml_startup_position::mouse,
++		[this, innerLock = std::move(lock)](const DynamicTintSettingsPage &panel, BaseXamlPageHost *host) mutable
++		{
++			m_DynamicSettingsHost = host;
++			innerLock.unlock();
++			auto closeRevoker = panel.Closed(winrt::auto_revoke, [this]
++			{
++				m_App.DispatchToMainThread([this]
++				{
++					std::scoped_lock guard(m_PickerMutex);
++					m_DynamicSettingsHost = nullptr;
++				});
++			});
++			panel.ParametersCommitted([this, revoker = std::move(closeRevoker)](int32_t zones, int32_t fps, int32_t sampling, int32_t depth, bool adaptiveSampling) mutable
++			{
++				revoker.revoke();
++				m_App.DispatchToMainThread([this, zones, fps, sampling, depth, adaptiveSampling]
++				{
++					auto &manager = m_App.GetConfigManager();
++					ApplyDynamicTintPanelSettings(manager.GetConfig().DynamicTint, zones, fps, sampling, depth, adaptiveSampling);
++					m_App.GetWorker().ConfigurationChanged();
++					manager.SaveConfig();
++					std::scoped_lock guard(m_PickerMutex);
++					m_DynamicSettingsHost = nullptr;
++				});
++			});
++		}, tint.Zones, tint.Fps, samples, tint.SampleDepth, tint.AdaptiveSampling);
++}
++
++void MainAppWindow::DynamicTintChanged(bool enabled)
++{
++	auto &manager = m_App.GetConfigManager();
++	manager.GetConfig().DynamicTint.Enabled = enabled;
++	m_App.GetWorker().ConfigurationChanged();
++	manager.SaveConfig();
+ }
+ 
+ void MainAppWindow::ColorRequested(const txmp::TaskbarState &state)
+diff --git a/TranslucentTB/mainappwindow.hpp b/TranslucentTB/mainappwindow.hpp
+--- a/TranslucentTB/mainappwindow.hpp
++++ b/TranslucentTB/mainappwindow.hpp
+@@ -31,6 +31,9 @@
+ 
+ 	page_t::TaskbarSettingsChanged_revoker m_TaskbarSettingsChangedRevoker;
+ 	page_t::ColorRequested_revoker m_ColorRequestedRevoker;
++	page_t::DynamicTintChanged_revoker m_DynamicTintChangedRevoker;
++	page_t::DynamicTintSettingsRequested_revoker m_DynamicTintSettingsRequestedRevoker;
++	BaseXamlPageHost *m_DynamicSettingsHost = nullptr;
+ 
+ 	page_t::OpenLogFileRequested_revoker m_OpenLogFileRequestedRevoker;
+ 	page_t::LogLevelChanged_revoker m_LogLevelChangedRevoker;
+@@ -55,6 +58,8 @@
+ 
+ 	void TaskbarSettingsChanged(const txmp::TaskbarState &state, const txmp::TaskbarAppearance &appearance);
+ 	void ColorRequested(const txmp::TaskbarState &state);
++	void DynamicTintChanged(bool enabled);
++	void DynamicTintSettingsRequested();
+ 
+ 	void OpenLogFileRequested();
+ 	void LogLevelChanged(const txmp::LogLevel &level);
+diff --git a/TranslucentTB/taskbar/dynamictint.cpp b/TranslucentTB/taskbar/dynamictint.cpp
+new file mode 100644
+--- /dev/null
++++ b/TranslucentTB/taskbar/dynamictint.cpp
+@@ -0,0 +1,441 @@
++﻿#include "arch.h"
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstdlib>
++#include <optional>
++#include <windef.h>
++#include <wingdi.h>
++
++#include "../../Common/win32.hpp"
++#include "dynamictint.hpp"
++
++namespace {
++
++    class CaptureSurface {
++        HDC m_Dc = nullptr;
++        HBITMAP m_Bitmap = nullptr;
++        HGDIOBJ m_Original = nullptr;
++        void *m_Bits = nullptr;
++        int m_Width = 0, m_Height = 0;
++        std::uint64_t m_Allocations = 0;
++    public:
++        CaptureSurface() = default;
++        CaptureSurface(const CaptureSurface &) = delete;
++        CaptureSurface &operator=(const CaptureSurface &) = delete;
++        ~CaptureSurface()
++        {
++            if (m_Dc && m_Original) SelectObject(m_Dc, m_Original);
++            if (m_Bitmap) DeleteObject(m_Bitmap);
++            if (m_Dc) DeleteDC(m_Dc);
++        }
++        bool Ensure(HDC screen, int width, int height) noexcept
++        {
++            if (!m_Dc) m_Dc = CreateCompatibleDC(screen);
++            if (!m_Dc) return false;
++            if (m_Bitmap && width == m_Width && height == m_Height) return true;
++            BITMAPINFO info { };
++            info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
++            info.bmiHeader.biWidth = width;
++            info.bmiHeader.biHeight = -height;
++            info.bmiHeader.biPlanes = 1;
++            info.bmiHeader.biBitCount = 32;
++            info.bmiHeader.biCompression = BI_RGB;
++            void *bits = nullptr;
++            const HBITMAP bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
++            if (!bitmap || !bits) { if (bitmap) DeleteObject(bitmap); return false; }
++            const HGDIOBJ old = SelectObject(m_Dc, bitmap);
++            if (!old || old == HGDI_ERROR) { DeleteObject(bitmap); return false; }
++            if (!m_Original) m_Original = old;
++            if (m_Bitmap) DeleteObject(m_Bitmap);
++            ++m_Allocations;
++            m_Bitmap = bitmap; m_Bits = bits; m_Width = width; m_Height = height;
++            return true;
++        }
++        std::uint64_t Allocations() const noexcept { return m_Allocations; }
++        HDC Dc() const noexcept { return m_Dc; }
++        void *Bits() const noexcept { return m_Bits; }
++    };
++    // A single bounded buffer per sampling thread, shared by single/zone paths.
++    CaptureSurface &CaptureBuffer() { static thread_local CaptureSurface surface; return surface; }
++
++	inline double SrgbToLinear(uint8_t value) noexcept
++	{
++		const double c = value / 255.0;
++		return c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4);
++	}
++
++	inline uint8_t LinearToSrgb(double value) noexcept
++	{
++		value = std::clamp(value, 0.0, 1.0);
++		const double c = value <= 0.0031308 ? value * 12.92 : 1.055 * std::pow(value, 1.0 / 2.4) - 0.055;
++		return static_cast<uint8_t>(std::lround(c * 255.0));
++	}
++
++	inline double WrapHue(double hue) noexcept
++	{
++		hue = std::fmod(hue, 360.0);
++		return hue < 0.0 ? hue + 360.0 : hue;
++	}
++}
++
++std::uint64_t DynamicTint::CaptureAllocationCount() noexcept { return CaptureBuffer().Allocations(); }
++
++std::optional<RECT> DynamicTint::ComputeSampleBand(const RECT &taskbar, const RECT &monitor, int depth) noexcept
++{
++	const LONG taskbarWidth = taskbar.right - taskbar.left;
++	const LONG taskbarHeight = taskbar.bottom - taskbar.top;
++	if (taskbarWidth <= 0 || taskbarHeight <= 0)
++	{
++		return std::nullopt;
++	}
++
++	const LONG gap = 10; // skip the bar's own border/shadow entirely
++	RECT band { };
++
++	const bool horizontal = taskbarWidth >= taskbarHeight;
++
++	if (depth <= 0)
++	{
++		// Automatic depth: the nearest 1/50 of the visible area. A very tight
++		// slice under the bar keeps the tint tied to the content it sits on and
++		// ignores motion further down the frame.
++		const LONG available = horizontal
++			? (taskbar.top - monitor.top <= monitor.bottom - taskbar.bottom ? monitor.bottom - taskbar.bottom : taskbar.top - monitor.top)
++			: (taskbar.left - monitor.left <= monitor.right - taskbar.right ? monitor.right - taskbar.right : taskbar.left - monitor.left);
++		depth = std::max<LONG>(2, static_cast<LONG>(std::lround(available / 50.0)));
++	}
++
++	const LONG reach = depth;
++	if (horizontal)
++	{
++		// A horizontal bar either hugs the top or the bottom of the monitor.
++		const bool atTop = taskbar.top - monitor.top <= monitor.bottom - taskbar.bottom;
++		if (atTop)
++		{
++			const LONG top = taskbar.bottom + gap;
++			const LONG bottom = reach > 0 ? std::min(top + reach, monitor.bottom) : monitor.bottom;
++			band = { taskbar.left, top, taskbar.right, bottom };
++		}
++		else
++		{
++			const LONG bottom = taskbar.top - gap;
++			const LONG top = reach > 0 ? std::max(bottom - reach, monitor.top) : monitor.top;
++			band = { taskbar.left, top, taskbar.right, bottom };
++		}
++	}
++	else
++	{
++		const bool atLeft = taskbar.left - monitor.left <= monitor.right - taskbar.right;
++		if (atLeft)
++		{
++			const LONG left = taskbar.right + gap;
++			const LONG right = reach > 0 ? std::min(left + reach, monitor.right) : monitor.right;
++			band = { left, taskbar.top, right, taskbar.bottom };
++		}
++		else
++		{
++			const LONG right = taskbar.left - gap;
++			const LONG left = reach > 0 ? std::max(right - reach, monitor.left) : monitor.left;
++			band = { left, taskbar.top, right, taskbar.bottom };
++		}
++	}
++
++	// Keep the band inside the monitor so we never sample another screen's
++	// content or the desktop's outside area.
++	band.left = std::max(band.left, monitor.left);
++	band.top = std::max(band.top, monitor.top);
++	band.right = std::min(band.right, monitor.right);
++	band.bottom = std::min(band.bottom, monitor.bottom);
++
++	if (band.right - band.left < 2 || band.bottom - band.top < 2)
++	{
++		return std::nullopt;
++	}
++
++	return band;
++}
++
++std::optional<Util::Color> DynamicTint::SampleBand(const RECT &band, int width, int height, float nearBias) noexcept
++{
++	const LONG sourceWidth = band.right - band.left;
++	const LONG sourceHeight = band.bottom - band.top;
++	if (sourceWidth < 1 || sourceHeight < 1 || width < 1 || height < 1)
++	{
++		return std::nullopt;
++	}
++
++	HDC screenDc = GetDC(nullptr);
++	if (!screenDc)
++	{
++		return std::nullopt;
++	}
++
++	auto &surface = CaptureBuffer();
++	if (!surface.Ensure(screenDc, width, height))
++	{
++		ReleaseDC(nullptr, screenDc);
++		return std::nullopt;
++	}
++	const HDC memDc = surface.Dc();
++	void *const bits = surface.Bits();
++
++	// Let GDI do the downsampling for us; the band is tiny so quality does not
++	// matter much, but a halftone stretch avoids aliasing artefacts.
++	SetStretchBltMode(memDc, COLORONCOLOR);
++
++	std::optional<Util::Color> result;
++	if (StretchBlt(memDc, 0, 0, width, height, screenDc, band.left, band.top, sourceWidth, sourceHeight, SRCCOPY))
++	{
++		GdiFlush();
++		double sumR = 0.0, sumG = 0.0, sumB = 0.0;
++		const auto *pixels = static_cast<const uint32_t *>(bits);
++		const std::size_t count = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
++
++		double weightSum = 0.0;
++		const double rowSpan = height > 1 ? static_cast<double>(height - 1) : 1.0;
++		for (std::size_t i = 0; i < count; ++i)
++		{
++			// 0xAARRGGBB, GDI writes in BGRA order on little endian.
++			const uint32_t pixel = pixels[i];
++			const uint8_t r = static_cast<uint8_t>(pixel >> 16);
++			const uint8_t g = static_cast<uint8_t>(pixel >> 8);
++			const uint8_t b = static_cast<uint8_t>(pixel);
++
++			// Weight saturated pixels much more than grey ones: averaging a
++			// colourful scene arithmetically washes it out into a muddy grey,
++			// while weighting by saturation keeps the scene's actual colour.
++			const uint8_t maximum = std::max({ r, g, b });
++			const uint8_t minimum = std::min({ r, g, b });
++			const double saturation = maximum == 0 ? 0.0 : static_cast<double>(maximum - minimum) / maximum;
++
++			// Rows closer to the taskbar are weighted more, so the bar stays
++			// visually connected to the content it sits on.
++			const double row = static_cast<double>((i / static_cast<std::size_t>(width)));
++			const double proximity = 1.0 - static_cast<double>(nearBias) * (row / rowSpan);
++			const double weight = (0.70 + 0.60 * saturation * saturation) * proximity;
++
++			sumB += SrgbToLinear(b) * weight;
++			sumG += SrgbToLinear(g) * weight;
++			sumR += SrgbToLinear(r) * weight;
++			weightSum += weight;
++		}
++
++		if (weightSum > 0.0)
++		{
++			result = Util::Color {
++				LinearToSrgb(sumR / weightSum),
++				LinearToSrgb(sumG / weightSum),
++				LinearToSrgb(sumB / weightSum),
++				255
++			};
++		}
++	}
++
++	ReleaseDC(nullptr, screenDc);
++
++	return result;
++}
++
++std::vector<Util::Color> DynamicTint::SampleBandZones(const RECT &band, int zones, int height, float nearBias) noexcept
++{
++	std::vector<Util::Color> result;
++
++	zones = std::clamp(zones, 2, 32);
++	height = std::clamp(height, 2, 32);
++
++	const LONG sourceWidth = band.right - band.left;
++	const LONG sourceHeight = band.bottom - band.top;
++	if (sourceWidth < zones || sourceHeight < 1)
++	{
++		return result;
++	}
++
++	static constexpr int COLUMNS_PER_ZONE = 8;
++	const int width = zones * COLUMNS_PER_ZONE;
++
++	HDC screenDc = GetDC(nullptr);
++	if (!screenDc)
++	{
++		return result;
++	}
++
++	auto &surface = CaptureBuffer();
++	if (!surface.Ensure(screenDc, width, height))
++	{
++		ReleaseDC(nullptr, screenDc);
++		return result;
++	}
++	const HDC memDc = surface.Dc();
++	void *const bits = surface.Bits();
++	SetStretchBltMode(memDc, COLORONCOLOR);
++
++	if (StretchBlt(memDc, 0, 0, width, height, screenDc, band.left, band.top, sourceWidth, sourceHeight, SRCCOPY))
++	{
++		GdiFlush();
++		result.resize(zones);
++		const auto *pixels = static_cast<const uint32_t *>(bits);
++
++		// Per zone: first work out the zone's dominant brightness, then drop rows
++		// that are much brighter than it. On a top taskbar the band's far edge
++		// lands on window chrome (title text, search boxes, app icons). Those
++		// pixels are a small part of the band, but they are bright and saturated,
++		// and because colours are mixed in linear light a white glyph is ~90x
++		// brighter than the dark window behind it, so it used to drag the whole
++		// zone towards its own hue - which is what made an otherwise white/black
++		// gradient show blue and yellow stops. Dropping those rows keeps the tint
++		// on the content the bar actually sits on.
++		for (int zone = 0; zone < zones; ++zone)
++		{
++			double rowLuma[32] = { };
++			bool keepRow[32] = { };
++			for (int y = 0; y < height; ++y)
++			{
++				double sum = 0.0;
++				for (int x = zone * COLUMNS_PER_ZONE; x < (zone + 1) * COLUMNS_PER_ZONE; ++x)
++				{
++					const uint32_t pixel = pixels[y * width + x];
++					sum += 0.299 * ((pixel >> 16) & 0xFF) + 0.587 * ((pixel >> 8) & 0xFF) + 0.114 * (pixel & 0xFF);
++				}
++				rowLuma[y] = sum / COLUMNS_PER_ZONE;
++			}
++
++			double sortedLuma[32] = { };
++			for (int y = 0; y < height; ++y)
++			{
++				sortedLuma[y] = rowLuma[y];
++			}
++			std::sort(sortedLuma, sortedLuma + height);
++			const double medianLuma = sortedLuma[height / 2];
++			const double rejectAbove = std::max(medianLuma * 1.5 + 6.0, 40.0);
++
++			int keepCount = 0;
++			for (int y = 0; y < height; ++y)
++			{
++				keepRow[y] = rowLuma[y] <= rejectAbove;
++				keepCount += keepRow[y] ? 1 : 0;
++			}
++			if (keepCount * 2 < height)
++			{
++				// Most of the band is bright, so there is nothing UI-like to
++				// discard; use every row.
++				for (int y = 0; y < height; ++y)
++				{
++					keepRow[y] = true;
++				}
++			}
++
++			struct ColumnSample
++			{
++				double sumR = 0.0, sumG = 0.0, sumB = 0.0, weightSum = 0.0;
++			};
++			ColumnSample columns[COLUMNS_PER_ZONE] = { };
++
++			for (int x = zone * COLUMNS_PER_ZONE; x < (zone + 1) * COLUMNS_PER_ZONE; ++x)
++			{
++				auto &column = columns[x - zone * COLUMNS_PER_ZONE];
++
++				for (int y = 0; y < height; ++y)
++				{
++					if (!keepRow[y])
++					{
++						continue;
++					}
++
++					const uint32_t pixel = pixels[y * width + x];
++					const uint8_t r = static_cast<uint8_t>(pixel >> 16);
++					const uint8_t g = static_cast<uint8_t>(pixel >> 8);
++					const uint8_t b = static_cast<uint8_t>(pixel);
++
++					const uint8_t maximum = std::max({ r, g, b });
++					const uint8_t minimum = std::min({ r, g, b });
++					const double saturation = maximum == 0 ? 0.0 : static_cast<double>(maximum - minimum) / maximum;
++					const double row = static_cast<double>(y);
++					const double rowSpan = height > 1 ? static_cast<double>(height - 1) : 1.0;
++					const double proximity = 1.0 - static_cast<double>(nearBias) * (row / rowSpan);
++					const double weight = (0.70 + 0.60 * saturation * saturation) * proximity;
++
++					column.sumB += SrgbToLinear(b) * weight;
++					column.sumG += SrgbToLinear(g) * weight;
++					column.sumR += SrgbToLinear(r) * weight;
++					column.weightSum += weight;
++				}
++			}
++
++			// Per-column colour (linear space), ignoring empty columns.
++			std::vector<std::pair<double, Util::Color>> columnColors;
++			columnColors.reserve(COLUMNS_PER_ZONE);
++			for (const auto &column : columns)
++			{
++				if (column.weightSum > 0.0)
++				{
++					const Util::Color color {
++						LinearToSrgb(column.sumR / column.weightSum),
++						LinearToSrgb(column.sumG / column.weightSum),
++						LinearToSrgb(column.sumB / column.weightSum),
++						255
++					};
++					columnColors.emplace_back(0.299 * color.R + 0.587 * color.G + 0.114 * color.B, color);
++				}
++			}
++
++			if (!columnColors.empty())
++			{
++				// Median column by luminance: robust against a small saturated
++				// feature occupying a minority of the zone's width.
++				std::sort(columnColors.begin(), columnColors.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
++				result[zone] = columnColors[columnColors.size() / 2].second;
++			}
++		}
++	}
++
++	ReleaseDC(nullptr, screenDc);
++
++	return result;
++}
++
++Util::Color DynamicTint::Adjust(const Util::Color &raw, const DynamicTintConfig &config) noexcept
++{
++	Util::HsvColor hsv = raw.ToHSV();
++
++	// Near-black pixels have a tiny max channel, which makes their *relative*
++	// saturation huge: (3,8,2) reports S = 0.75 and would be lifted into a vivid
++	// green by the brightness floor. Such colours are noise, not hue, so they
++	// are treated as neutral and only get a faint tint as they brighten.
++	if (hsv.V < 0.08)
++	{
++		hsv.S = 0.0;
++	}
++	else if (hsv.V < 0.20)
++	{
++		hsv.S *= hsv.V / 0.20;
++	}
++
++	hsv.S = std::clamp(hsv.S * config.SaturationBoost, 0.0, 1.0);
++	hsv.V = std::clamp(hsv.V, static_cast<double>(config.MinValue), static_cast<double>(config.MaxValue));
++
++	return Util::Color::FromHSV(WrapHue(hsv.H), hsv.S, hsv.V);
++}
++
++Util::Color DynamicTint::Blend(const Util::Color &from, const Util::Color &to, float factor) noexcept
++{
++	factor = std::clamp(factor, 0.0f, 1.0f);
++
++	// RGB interpolation only. Hue-arc blending sounds appealing but swings the
++	// fade through saturated colours that exist in neither scene (orange to
++	// blue via red or green, grey to blue via purple), which reads as the tint
++	// "jumping" to random hues. A straight RGB crossfade is what mixing the two
++	// scenes' light actually looks like.
++	const auto lerp = [factor](uint8_t x, uint8_t y)
++	{
++		return static_cast<uint8_t>(std::lround(x + (static_cast<double>(y) - x) * factor));
++	};
++	return { lerp(from.R, to.R), lerp(from.G, to.G), lerp(from.B, to.B), 255 };
++}
++
++int DynamicTint::ColorDelta(const Util::Color &a, const Util::Color &b) noexcept
++{
++	return std::abs(static_cast<int>(a.R) - static_cast<int>(b.R)) +
++		std::abs(static_cast<int>(a.G) - static_cast<int>(b.G)) +
++		std::abs(static_cast<int>(a.B) - static_cast<int>(b.B));
++}
+\ No newline at end of file
+diff --git a/TranslucentTB/taskbar/dynamictint.hpp b/TranslucentTB/taskbar/dynamictint.hpp
+new file mode 100644
+--- /dev/null
++++ b/TranslucentTB/taskbar/dynamictint.hpp
+@@ -0,0 +1,38 @@
++﻿#pragma once
++#include "arch.h"
++#include <optional>
++#include <cstdint>
++#include <vector>
++#include <windef.h>
++
++#include "../../Common/config/dynamictint.hpp"
++#include "../../Common/util/color.hpp"
++
++// Helpers for the dynamic taskbar tint: they work purely on screen pixels and
++// on plain RGB/HSV values, so they are independent from the taskbar plumbing.
++namespace DynamicTint {
++	// Read-only count for diagnostics and capture-resource regression tests.
++	std::uint64_t CaptureAllocationCount() noexcept;
++	// Picks the strip of screen pixels that best represents the content "behind"
++	// the taskbar: just inside the taskbar, towards the middle of the monitor.
++	std::optional<RECT> ComputeSampleBand(const RECT &taskbar, const RECT &monitor, int depth) noexcept;
++
++	// Averages the band of the screen into a single colour. Returns nothing if
++	// the screen could not be captured (protected content, secure desktop...).
++	std::optional<Util::Color> SampleBand(const RECT &band, int width, int height, float nearBias) noexcept;
++
++	// Same capture, but split horizontally into `zones` independent colours.
++	// Returns an empty vector when the screen could not be captured.
++	std::vector<Util::Color> SampleBandZones(const RECT &band, int zones, int height, float nearBias) noexcept;
++
++	// Boosts saturation and clamps brightness so the tint stays readable.
++	Util::Color Adjust(const Util::Color &raw, const DynamicTintConfig &config) noexcept;
++
++	// Moves from one colour towards another by the given factor, interpolating
++	// hue along the shortest arc so colour changes never go through grey.
++	Util::Color Blend(const Util::Color &from, const Util::Color &to, float factor) noexcept;
++
++	// Sum of the absolute per-channel differences, used to decide whether
++	// another appearance update is worth sending.
++	int ColorDelta(const Util::Color &a, const Util::Color &b) noexcept;
++}
+\ No newline at end of file
+diff --git a/TranslucentTB/taskbar/taskbarattributeworker.cpp b/TranslucentTB/taskbar/taskbarattributeworker.cpp
+--- a/TranslucentTB/taskbar/taskbarattributeworker.cpp
++++ b/TranslucentTB/taskbar/taskbarattributeworker.cpp
+@@ -1,4 +1,6 @@
+-#include "taskbarattributeworker.hpp"
++﻿#include "taskbarattributeworker.hpp"
++#include <algorithm>
++#include <cmath>
+ #include <functional>
+ #include <member_thunk/member_thunk.hpp>
+ #include <set>
+@@ -61,6 +63,10 @@
+ template<DWORD insert, DWORD remove>
+ void TaskbarAttributeWorker::WindowInsertRemove(DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD)
+ {
++	if (event == insert)
++	{
++		RefreshDynamicTintAfterContentChange(hwnd);
++	}
+ 	if (const Window window(hwnd); idObject == OBJID_WINDOW && idChild == CHILDID_SELF)
+ 	{
+ 		if (event == insert && window.valid())
+@@ -88,6 +94,7 @@
+ 
+ void TaskbarAttributeWorker::OnWindowStateChange(DWORD, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD)
+ {
++	RefreshDynamicTintAfterContentChange(hwnd);
+ 	if (const Window window(hwnd); idObject == OBJID_WINDOW && idChild == CHILDID_SELF && window.valid())
+ 	{
+ 		InsertWindow(window, true);
+@@ -96,6 +103,10 @@
+ 
+ void TaskbarAttributeWorker::OnWindowCreateDestroy(DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD)
+ {
++	if (event == EVENT_OBJECT_CREATE)
++	{
++		RefreshDynamicTintAfterContentChange(hwnd);
++	}
+ 	if (const Window window(hwnd); idObject == OBJID_WINDOW && idChild == CHILDID_SELF)
+ 	{
+ 		if (event == EVENT_OBJECT_CREATE && window.valid())
+@@ -137,6 +148,7 @@
+ {
+ 	if (idObject == OBJID_WINDOW && idChild == CHILDID_SELF)
+ 	{
++		UpdateDynamicTint();
+ 		const Window oldForegroundWindow = std::exchange(m_ForegroundWindow, Window(hwnd).valid() ? hwnd : Window::NullWindow);
+ 
+ 		if (Error::ShouldLog<spdlog::level::debug>())
+@@ -170,6 +182,7 @@
+ 
+ void TaskbarAttributeWorker::OnWindowOrderChange(DWORD, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD)
+ {
++	RefreshDynamicTintAfterContentChange(hwnd);
+ 	if (const Window window(hwnd); idObject == OBJID_WINDOW && idChild == CHILDID_SELF && window.valid())
+ 	{
+ 		if (const auto iter = m_Taskbars.find(window.monitor()); iter != m_Taskbars.end())
+@@ -320,6 +333,33 @@
+ 
+ LRESULT TaskbarAttributeWorker::MessageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam)
+ {
++	if (m_DynamicStatsMessage && uMsg == m_DynamicStatsMessage)
++	{
++		switch (wParam)
++		{
++		case 0: return static_cast<LRESULT>(m_DynamicTicks);
++		case 1: return static_cast<LRESULT>(m_DynamicCaptures);
++		case 2: return static_cast<LRESULT>(m_DynamicWrites);
++		case 3: return m_DynamicTickMs.load();
++		case 4: return m_ConfigManager.GetConfig().DynamicTint.AdaptiveSampling;
++		case 5: return static_cast<LRESULT>(m_DynamicInputs);
++		case 6: return GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
++		case 7: return static_cast<LRESULT>(DynamicTint::CaptureAllocationCount());
++		case 8: return static_cast<LRESULT>(m_DynamicStops);
++		default: return 0;
++		}
++	}
++	if (uMsg == WM_DYNAMIC_INPUT)
++	{
++		m_InputPosted.store(false);
++		if (m_InputContent.exchange(false))
++		{
++			++m_DynamicInputs;
++			m_DynamicSchedule.Activity(GetTickCount64());
++		}
++		UpdateDynamicTint();
++		return 0;
++	}
+ 	if (uMsg == WM_SETTINGCHANGE)
+ 	{
+ 		if (InSendMessage())
+@@ -388,6 +428,12 @@
+ 		} catch (const std::out_of_range&) {
+ 			return 1;
+ 		}
++		return 0;
++	}
++	else if (uMsg == WM_TIMER && wParam == m_DynamicTimerId)
++	{
++		m_DynamicTickPosted.store(false);
++		UpdateDynamicTint();
+ 		return 0;
+ 	}
+ 
+@@ -547,6 +593,39 @@
+ 
+ void TaskbarAttributeWorker::SetAttribute(taskbar_iterator taskbar, TaskbarAppearance config)
+ {
++	if (m_DynamicRunning)
++	{
++		const auto monitor = GetTaskbarMonitor(taskbar->second.Taskbar.TaskbarWindow);
++		if (const auto it = m_DynamicColors.find(monitor); it != m_DynamicColors.end())
++		{
++			if (it->second.size() >= 2 && m_TaskbarService)
++			{
++				// Any state refresh (Start menu, a taskbar click, Win key...) would
++				// otherwise repaint the configured colour for a frame, which shows
++				// as the bar flashing back to its old look. Re-push the current
++				// gradient instead so the tint never drops out.
++				const UINT count = static_cast<UINT>(it->second.size());
++				const auto alpha = m_ConfigManager.GetConfig().DynamicTint.Alpha;
++				std::vector<UINT> abgr(count);
++				std::vector<FLOAT> offsets(count);
++				for (UINT i = 0; i < count; ++i)
++				{
++					abgr[i] = Util::Color { it->second[i].R, it->second[i].G, it->second[i].B, alpha }.ToABGR();
++					offsets[i] = static_cast<FLOAT>(i) / static_cast<FLOAT>(count - 1);
++				}
++				m_TaskbarService->SetTaskbarGradient(taskbar->second.Taskbar.TaskbarWindow, count, abgr.data(), offsets.data());
++				return;
++			}
++
++			if (it->second.size() == 1)
++			{
++				const auto alpha = m_ConfigManager.GetConfig().DynamicTint.Alpha;
++				config.Accent = ACCENT_ENABLE_ACRYLICBLURBEHIND;
++				config.Color = Util::Color { it->second[0].R, it->second[0].G, it->second[0].B, alpha };
++			}
++		}
++	}
++
+ 	if (m_TaskbarService)
+ 	{
+ 		if (config.Accent == ACCENT_NORMAL)
+@@ -650,6 +729,634 @@
+ 	for (auto it = m_Taskbars.begin(); it != m_Taskbars.end(); ++it)
+ 	{
+ 		refresher.refresh(it);
++	}
++}
++
++bool TaskbarAttributeWorker::IsFullscreenOnMonitor(HMONITOR monitor) const
++{
++	MONITORINFO monitorInfo { sizeof(monitorInfo) };
++	if (!GetMonitorInfo(monitor, &monitorInfo)) [[unlikely]]
++	{
++		return false;
++	}
++
++	const Window foreground = Window::ForegroundWindow();
++	if (!foreground.valid() || foreground.handle() == DesktopWindow() || foreground.handle() == ShellWindow() || foreground.handle() == m_WindowHandle)
++	{
++		return false;
++	}
++
++	if (!foreground.visible() || foreground.cloaked())
++	{
++		return false;
++	}
++
++	const auto rect = foreground.rect();
++	if (!rect) [[unlikely]]
++	{
++		return false;
++	}
++
++	static constexpr LONG TOLERANCE = 2;
++	const RECT &screen = monitorInfo.rcMonitor;
++	return rect->left <= screen.left + TOLERANCE && rect->top <= screen.top + TOLERANCE &&
++		rect->right >= screen.right - TOLERANCE && rect->bottom >= screen.bottom - TOLERANCE;
++}
++
++namespace {
++	// True while the cursor sits on the taskbar itself or on one of its flyouts
++	// (thumbnail previews, jump lists...). Those surfaces overlap the sampled
++	// band, so sampling them would feed window thumbnails into the tint.
++	bool IsShellUiUnderCursor() noexcept
++	{
++		POINT point { };
++		if (!GetCursorPos(&point))
++		{
++			return false;
++		}
++
++		const HWND under = WindowFromPoint(point);
++		if (!under)
++		{
++			return false;
++		}
++
++		wchar_t class_name[64] { };
++		const HWND root = GetAncestor(under, GA_ROOT);
++		if (!GetClassNameW(root ? root : under, class_name, static_cast<int>(sizeof(class_name) / sizeof(class_name[0]))))
++		{
++			return false;
++		}
++
++		// The taskbar itself (primary or secondary), or anything inside it.
++		if (wcscmp(class_name, L"Shell_TrayWnd") == 0 || wcscmp(class_name, L"Shell_SecondaryTrayWnd") == 0)
++		{
++			return true;
++		}
++
++		// Flyouts such as thumbnail previews and jump lists are topmost tool
++		// windows owned by explorer. A normal Explorer window (CabinetWClass)
++		// is not a tool window and must never freeze sampling - hovering the
++		// file manager is ordinary usage, not shell UI.
++		if ((GetWindowLongPtrW(under, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0)
++		{
++			DWORD pid = 0;
++			GetWindowThreadProcessId(under, &pid);
++
++			const HWND shell = GetShellWindow();
++			DWORD shellPid = 0;
++			if (shell)
++			{
++				GetWindowThreadProcessId(shell, &shellPid);
++			}
++
++			return shellPid != 0 && pid == shellPid;
++		}
++
++		return false;
++	}
++
++	Util::Color MedianColor(const std::deque<std::vector<Util::Color>> &history, std::size_t index) noexcept
++	{
++		std::array<BYTE, 9> reds { }, greens { }, blues { };
++		const std::size_t count = std::min<std::size_t>(history.size(), reds.size());
++		if (count == 0)
++		{
++			return { 0, 0, 0, 255 };
++		}
++
++		for (std::size_t i = 0; i < count; ++i)
++		{
++			const auto &color = history[i][index];
++			reds[i] = color.R;
++			greens[i] = color.G;
++			blues[i] = color.B;
++		}
++
++		auto medianOf = [count](std::array<BYTE, 9> &values) noexcept
++		{
++			std::sort(values.begin(), values.begin() + count);
++			return values[count / 2];
++		};
++
++		return { medianOf(reds), medianOf(greens), medianOf(blues), 255 };
++	}
++}
++
++void TaskbarAttributeWorker::RefreshDynamicTintAfterContentChange(HWND hwnd)
++{
++	if (!hwnd || !m_ConfigManager.GetConfig().DynamicTint.Enabled) return;
++	const HWND foreground = GetForegroundWindow();
++	if (GetAncestor(hwnd, GA_ROOT) != foreground) return;
++	const auto name = Window(foreground).classname();
++	if (!name || *name == TASKBAR || *name == SECONDARY_TASKBAR || *name == L"TaskListThumbnailWnd") return;
++	const auto now = GetTickCount64();
++	m_DynamicSchedule.Activity(now);
++	if (foreground == m_HoverStartupWindow && now <= m_HoverStartupUntil)
++	{
++		m_HoverRefreshPending = true;
++		m_HoverRefreshAfter = std::min(now + 120, m_HoverStartupUntil);
++	}
++	ScheduleDynamicTick(1);
++}
++
++void TaskbarAttributeWorker::UpdateDynamicTint()
++{
++	const DynamicTintConfig &tint = m_ConfigManager.GetConfig().DynamicTint;
++	static constexpr UINT IDLE_INTERVAL = 500;
++	++m_DynamicTicks;
++	const bool monitorInput = tint.Enabled && tint.AdaptiveSampling;
++	if (m_InputMonitoring.exchange(monitorInput) != monitorInput && m_DynamicTickWakeEvent) SetEvent(m_DynamicTickWakeEvent);
++
++	if (!tint.Enabled || m_Taskbars.empty())
++	{
++		if (m_DynamicRunning || m_ShellFrozen || m_DynamicPreviewMonitor)
++		{
++			StopDynamicTint(L"dynamic tint disabled");
++		}
++		m_HoverTracking.store(false);
++		ScheduleDynamicTick(INFINITE);
++		return;
++	}
++
++	const auto now = std::chrono::steady_clock::now();
++	const ULONGLONG tickNow = GetTickCount64();
++	const UINT sampleMs = tint.SampleInterval > 0 ? static_cast<UINT>(tint.SampleInterval)
++		: std::max<UINT>(1, 1000u / static_cast<UINT>(std::clamp(tint.SamplesPerSecond, 1, 60)));
++	const UINT frameMs = std::max<UINT>(1, 1000u / static_cast<UINT>(std::clamp(tint.Fps, 20, 120)));
++	bool animationNeeded = false, samplingBlocked = false;
++	auto schedule = wil::scope_exit([&]
++	{
++		unsigned delay = frameMs;
++		if (tint.AdaptiveSampling)
++		{
++			delay = m_DynamicSchedule.Delay(GetTickCount64(), sampleMs, true);
++			if (animationNeeded) delay = std::min(delay, frameMs);
++			if (samplingBlocked) delay = animationNeeded ? frameMs : 80;
++		}
++		ScheduleDynamicTick(std::max(1u, delay));
++	});
++	const HWND foreground = GetForegroundWindow();
++	const bool foregroundChanged = foreground && foreground != m_LastDynamicForeground;
++	if (foreground)
++	{
++		m_LastDynamicForeground = foreground;
++	}
++	if (foregroundChanged)
++	{
++		// A selected application is not a thumbnail hover, even if the cursor
++		// is still in the first 320 pixels of its content. Do not rearm until
++		// the cursor leaves the bar and starts another hover gesture.
++		m_DynamicPreviewMonitor = nullptr;
++		m_DynamicPreviewCancelled = true;
++		m_ShellFastResume = true;
++		m_ShellDismissUntil = std::min(m_ShellDismissUntil, tickNow + 80);
++		// Keep the displayed colours as the new fade's origin, but discard
++		// the previous application's targets, median history and transition.
++		m_DynamicTargets.clear();
++		m_DynamicHistory.clear();
++		m_DynamicTransitions.clear();
++		m_LastDynamicSample = { };
++		m_HoverRefreshPending = true;
++		m_HoverRefreshAfter = tickNow + 250;
++		m_HoverAnimating = false;
++		m_HoverStartupWindow = nullptr;
++		m_HoverStartupUntil = 0;
++		m_DynamicSchedule.Startup(tickNow);
++		if (const auto className = Window(foreground).classname(); className && *className != TASKBAR && *className != SECONDARY_TASKBAR && *className != L"TaskListThumbnailWnd")
++		{
++			m_HoverStartupWindow = foreground;
++			m_HoverStartupUntil = tickNow + 6000;
++		}
++	}
++	// Search/task-view buttons can belong to other processes, and thumbnail
++	// islands may be hit-test transparent. Protect the taskbar rectangle and
++	// its preview neighbourhood without relying exclusively on window classes.
++	bool cursorOnShell = false;
++	bool cursorOnBar = false;
++	POINT cursorPoint { };
++	if (GetCursorPos(&cursorPoint))
++	{
++		static constexpr LONG PREVIEW_REACH = 320;
++		bool nearArmedBar = false;
++		for (const auto &[monitor, info] : m_Taskbars)
++		{
++			const auto rect = info.Taskbar.TaskbarWindow.rect();
++			if (!rect)
++			{
++				continue;
++			}
++
++			if (cursorPoint.x >= rect->left && cursorPoint.x < rect->right &&
++				cursorPoint.y >= rect->top && cursorPoint.y < rect->bottom)
++			{
++				cursorOnShell = true;
++				cursorOnBar = true;
++				if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0 ||
++					(GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0)
++				{
++					m_DynamicPreviewCancelled = true;
++					m_ShellFastResume = true;
++				}
++				m_DynamicPreviewMonitor = m_DynamicPreviewCancelled ? nullptr : monitor;
++				break;
++			}
++
++			if (m_DynamicPreviewMonitor == monitor &&
++				cursorPoint.x >= rect->left - PREVIEW_REACH && cursorPoint.x < rect->right + PREVIEW_REACH &&
++				cursorPoint.y >= rect->top - PREVIEW_REACH && cursorPoint.y < rect->bottom + PREVIEW_REACH)
++			{
++				nearArmedBar = true;
++			}
++		}
++		if (!cursorOnShell)
++		{
++			m_HoverRefreshPending = false;
++			cursorOnShell = nearArmedBar;
++			m_DynamicPreviewCancelled = false;
++			if (!nearArmedBar)
++			{
++				m_DynamicPreviewMonitor = nullptr;
++			}
++		}
++	}
++	else
++	{
++		// A failed cursor query must not release an existing freeze.
++		cursorOnShell = m_ShellFrozen;
++	}
++
++	const bool shellHover = cursorOnShell || IsShellUiUnderCursor();
++	m_HoverTracking.store(cursorOnShell);
++	const bool refreshHovered = cursorOnBar && m_HoverRefreshPending && tickNow >= m_HoverRefreshAfter;
++	samplingBlocked = shellHover;
++	const bool applyHovered = cursorOnBar && (refreshHovered || m_HoverAnimating);
++	if (!shellHover)
++	{
++		m_HoverAnimating = false;
++	}
++	if (shellHover && !applyHovered)
++	{
++		// Let the flyout's closing animation finish before sampling its pixels.
++		// Application selection needs only a short compositor settling time;
++		// an ordinary thumbnail dismissal keeps the existing closing grace.
++		m_ShellDismissUntil = tickNow + (m_ShellFastResume ? 80 : 250);
++	}
++	if (!applyHovered && (shellHover || tickNow < m_ShellDismissUntil))
++	{
++		if (!m_ShellFrozen)
++		{
++			m_ShellFrozen = true;
++				m_ShellFreezeStart = now;
++		}
++		// Pause the entire pipeline: sampling, transitions and gradient pushes.
++		return;
++	}
++	if (!shellHover) samplingBlocked = false;
++	if (m_ShellFrozen)
++	{
++		const auto frozenFor = now - m_ShellFreezeStart;
++		for (auto &[monitor, transitions] : m_DynamicTransitions)
++		{
++			for (auto &transition : transitions)
++			{
++				if (transition.Active)
++				{
++					transition.Start += frozenFor;
++				}
++			}
++		}
++		m_ShellFrozen = false;
++	}
++	m_ShellFastResume = false;
++	const bool sampleDue = (!shellHover || refreshHovered) &&
++		(refreshHovered || !m_DynamicRunning || m_DynamicSchedule.Due(tickNow, sampleMs, tint.AdaptiveSampling));
++
++	if (sampleDue)
++	{
++		m_LastDynamicSample = now;
++		bool capturedChange = false;
++
++		std::unordered_map<HMONITOR, std::vector<Util::Color>> targets;
++
++		for (const auto &[monitor, info] : m_Taskbars)
++		{
++			if (tint.OnlyFullscreen && !IsFullscreenOnMonitor(monitor))
++			{
++				continue;
++			}
++
++			MONITORINFO monitorInfo { sizeof(monitorInfo) };
++			if (!GetMonitorInfo(monitor, &monitorInfo)) [[unlikely]]
++			{
++				continue;
++			}
++
++			const auto taskbarRect = info.Taskbar.TaskbarWindow.rect();
++			if (!taskbarRect) [[unlikely]]
++			{
++				continue;
++			}
++
++			const auto band = DynamicTint::ComputeSampleBand(*taskbarRect, monitorInfo.rcMonitor, tint.SampleDepth);
++			if (!band)
++			{
++				continue;
++			}
++
++
++			std::vector<Util::Color> sampled;
++			if (tint.Zones > 1 && m_TaskbarService)
++			{
++				sampled = DynamicTint::SampleBandZones(*band, tint.Zones, 12, tint.NearBias);
++			}
++			else if (const auto single = DynamicTint::SampleBand(*band, tint.SampleWidth, 12, tint.NearBias); single)
++			{
++				sampled.push_back(*single);
++			}
++
++			if (sampled.empty())
++			{
++				continue;
++			}
++
++			for (auto &color : sampled)
++			{
++				color = DynamicTint::Adjust(color, tint);
++			}
++
++			++m_DynamicCaptures;
++			const auto oldTarget = m_DynamicTargets.find(monitor);
++			if (oldTarget == m_DynamicTargets.end() || oldTarget->second.size() != sampled.size()) capturedChange = true;
++			else for (std::size_t i = 0; i < sampled.size(); ++i)
++				capturedChange = capturedChange || DynamicTint::ColorDelta(oldTarget->second[i], sampled[i]) > tint.Deadband;
++
++			// A large jump against the previous target means the scene changed:
++			// keeping the old window would smear the previous scene over the new
++			// one, so restart it with this sample (no median lag on cuts).
++			bool cut = false;
++			if (const auto previous = m_DynamicTargets.find(monitor); previous != m_DynamicTargets.end() && previous->second.size() == sampled.size())
++			{
++				for (std::size_t i = 0; i < sampled.size(); ++i)
++				{
++					if (DynamicTint::ColorDelta(previous->second[i], sampled[i]) >= tint.CutThreshold)
++					{
++						cut = true;
++						break;
++					}
++				}
++			}
++
++			auto &history = m_DynamicHistory[monitor];
++			if (cut || refreshHovered)
++			{
++				history.clear();
++			}
++			history.push_back(sampled);
++			while (history.size() > static_cast<std::size_t>(tint.MedianWindow))
++			{
++				history.pop_front();
++			}
++
++			std::vector<Util::Color> filtered(sampled.size());
++			for (std::size_t i = 0; i < filtered.size(); ++i)
++			{
++				filtered[i] = MedianColor(history, i);
++			}
++
++
++			targets[monitor] = std::move(filtered);
++		}
++
++		m_DynamicSchedule.Sampled(tickNow, capturedChange);
++		if (refreshHovered)
++		{
++			m_HoverRefreshPending = false;
++			m_HoverAnimating = !targets.empty();
++		}
++
++		for (auto it = m_DynamicTargets.begin(); it != m_DynamicTargets.end();)
++		{
++			if (!targets.contains(it->first))
++			{
++				m_DynamicHistory.erase(it->first);
++				it = m_DynamicTargets.erase(it);
++			}
++			else
++			{
++				++it;
++			}
++		}
++
++		for (auto &[monitor, colors] : targets)
++		{
++			m_DynamicTargets[monitor] = colors;
++		}
++	}
++
++	if (m_DynamicTargets.empty())
++	{
++		// A foreground change invalidates targets before the adaptive deadline
++		// permits another capture. Keep the displayed colours and cached brush
++		// through that gap; an empty pending target is not a request to restore
++		// every taskbar to its configured (often transparent) appearance.
++		if (!sampleDue)
++		{
++			return;
++		}
++		if (m_DynamicRunning)
++		{
++			StopDynamicTint(L"no fullscreen content to sample");
++		}
++		else
++		{
++			m_DynamicTickMs.store(IDLE_INTERVAL, std::memory_order_relaxed);
++		}
++		return;
++	}
++
++	// Animate every tick towards the (median-filtered) target.
++	bool changed = !m_DynamicRunning;
++	bool hoverTransitionActive = false;
++	for (auto &[monitor, target] : m_DynamicTargets)
++	{
++		auto &current = m_DynamicColors[monitor];
++		if (current.size() != target.size())
++		{
++			current = target;
++			m_DynamicTransitions.erase(monitor);
++			changed = true;
++			continue;
++		}
++
++		auto &transitions = m_DynamicTransitions[monitor];
++		transitions.resize(target.size());
++
++		// If any zone makes a scene-sized jump, the whole bar eases together:
++		// zones whose colours barely move would otherwise crawl there on the
++		// slow exponential path while their neighbours finish in 240 ms, which
++		// reads as the bar tearing apart mid-transition.
++		int maxDelta = 0;
++		for (std::size_t i = 0; i < target.size(); ++i)
++		{
++			maxDelta = std::max(maxDelta, DynamicTint::ColorDelta(current[i], target[i]));
++		}
++		const bool cut = maxDelta >= tint.CutThreshold;
++
++		for (std::size_t i = 0; i < target.size(); ++i)
++		{
++			ZoneTransition &transition = transitions[i];
++
++			// A large jump starts a fixed-duration eased transition: it advances
++			// evenly, finishes in cut_duration_ms, and lands exactly on target.
++			// Small in-scene changes keep the slow exponential damping instead.
++			if (!transition.Active && (cut || DynamicTint::ColorDelta(current[i], target[i]) >= tint.CutThreshold))
++			{
++				transition.From = current[i];
++				transition.To = target[i];
++				transition.Start = now;
++				transition.DurationMs = tint.CutDurationMs;
++				transition.Active = true;
++			}
++
++			Util::Color next{ };
++			if (transition.Active)
++			{
++				// Follow the latest sample while the cut fades in.
++				transition.To = target[i];
++				const double elapsedMs = std::chrono::duration<double, std::milli>(now - transition.Start).count();
++				const double t = std::clamp(elapsedMs / transition.DurationMs, 0.0, 1.0);
++				const double eased = t * t * (3.0 - 2.0 * t);
++				next = (t >= 1.0) ? transition.To : DynamicTint::Blend(transition.From, transition.To, static_cast<float>(eased));
++				if (t >= 1.0)
++				{
++					transition.Active = false;
++				}
++			}
++			else
++			{
++				next = DynamicTint::Blend(current[i], target[i], tint.Smoothing);
++				if (DynamicTint::ColorDelta(next, target[i]) <= tint.Deadband)
++				{
++					// Snap instead of dragging an exponential tail.
++					next = target[i];
++				}
++			}
++
++			if (DynamicTint::ColorDelta(current[i], next) > 0)
++			{
++				changed = true;
++			}
++			current[i] = next;
++			hoverTransitionActive = hoverTransitionActive || transition.Active ||
++				DynamicTint::ColorDelta(current[i], target[i]) > 0;
++		}
++	}
++
++	for (auto it = m_DynamicColors.begin(); it != m_DynamicColors.end();)
++	{
++		if (!m_DynamicTargets.contains(it->first))
++		{
++			it = m_DynamicColors.erase(it);
++			changed = true;
++		}
++		else
++		{
++			++it;
++		}
++	}
++
++	animationNeeded = hoverTransitionActive;
++	m_DynamicRunning = true;
++	if (!hoverTransitionActive)
++	{
++		m_HoverAnimating = false;
++	}
++
++	if (!changed)
++	{
++		return;
++	}
++
++	const bool gradient = tint.Zones > 1 && m_TaskbarService;
++	if (gradient)
++	{
++		for (const auto &[monitor, colors] : m_DynamicColors)
++		{
++			if (colors.size() < 2)
++			{
++				continue;
++			}
++
++			const auto it = m_Taskbars.find(monitor);
++			if (it == m_Taskbars.end())
++			{
++				continue;
++			}
++
++			const UINT count = static_cast<UINT>(colors.size());
++			std::vector<UINT> abgr(count);
++			std::vector<FLOAT> offsets(count);
++			for (UINT i = 0; i < count; ++i)
++			{
++				abgr[i] = Util::Color { colors[i].R, colors[i].G, colors[i].B, tint.Alpha }.ToABGR();
++				offsets[i] = static_cast<FLOAT>(i) / static_cast<FLOAT>(count - 1);
++			}
++
++
++			++m_DynamicWrites;
++			HresultVerify(m_TaskbarService->SetTaskbarGradient(it->second.Taskbar.TaskbarWindow, count, abgr.data(), offsets.data()), spdlog::level::info, L"Failed to set taskbar gradient");
++		}
++	}
++	else
++	{
++		for (const auto &[monitor, colors] : m_DynamicColors)
++		{
++			if (colors.empty())
++			{
++				continue;
++			}
++
++			if (const auto it = m_Taskbars.find(monitor); it != m_Taskbars.end())
++			{
++				SetAttribute(it, GetConfig(it));
++			}
++		}
++	}
++}
++
++void TaskbarAttributeWorker::StopDynamicTint(std::wstring_view reason)
++{
++	if (Error::ShouldLog<spdlog::level::debug>())
++	{
++		MessagePrint(spdlog::level::debug, std::format(L"Stopping dynamic tint: {}", reason));
++	}
++
++	const bool wasRunning = m_DynamicRunning;
++	if (wasRunning) ++m_DynamicStops;
++	m_DynamicRunning = false;
++	m_ShellFrozen = false;
++	m_ShellFreezeStart = { };
++	m_ShellDismissUntil = 0;
++	m_DynamicPreviewMonitor = nullptr;
++	m_DynamicPreviewCancelled = false;
++	m_ShellFastResume = false;
++	m_LastDynamicForeground = nullptr;
++	m_HoverRefreshPending = false;
++	m_HoverRefreshAfter = 0;
++	m_HoverAnimating = false;
++	m_HoverStartupWindow = nullptr;
++	m_HoverStartupUntil = 0;
++	m_DynamicColors.clear();
++	m_DynamicTargets.clear();
++	m_DynamicHistory.clear();
++	m_DynamicTransitions.clear();
++
++	m_DynamicTickMs.store(500, std::memory_order_relaxed);
++
++	if (wasRunning)
++	{
++		RefreshAllAttributes();
+ 	}
+ }
+ 
+@@ -1287,8 +1994,125 @@
+ 		}
+ 	}
+ 
++	// The tint is driven by a high-resolution waitable timer on its own thread:
++	// WM_TIMER alone is limited to the ~15.6 ms system tick, which caps the
++	// animation at ~64 fps. The thread only wakes and posts a tick.
++	m_DynamicTimerId = 0x5454;
++	StartDynamicTickThread();
++
+ 	// we don't want to consider the first state reset as an Explorer restart.
+ 	ResetState(true);
++}
++
++thread_local TaskbarAttributeWorker *TaskbarAttributeWorker::s_InputWorker = nullptr;
++
++void TaskbarAttributeWorker::ScheduleDynamicTick(unsigned milliseconds)
++{
++    if (m_DynamicTickMs.exchange(milliseconds) != milliseconds && m_DynamicTickWakeEvent)
++        SetEvent(m_DynamicTickWakeEvent);
++}
++
++void TaskbarAttributeWorker::SignalDynamicInput(bool content)
++{
++    if (!m_InputMonitoring.load() || m_DynamicTickStop.load()) return;
++    if (content) m_InputContent.store(true);
++    if (!m_InputPosted.exchange(true))
++    {
++        if (!PostMessageW(m_WindowHandle, WM_DYNAMIC_INPUT, 0, 0)) m_InputPosted.store(false);
++    }
++}
++
++LRESULT CALLBACK TaskbarAttributeWorker::DynamicKeyboardHook(int code, WPARAM wParam, LPARAM lParam)
++{
++    if (code >= 0 && s_InputWorker && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN))
++        s_InputWorker->SignalDynamicInput(true);
++    // No key code, text or input payload is inspected, stored or suppressed.
++    return CallNextHookEx(nullptr, code, wParam, lParam);
++}
++
++LRESULT CALLBACK TaskbarAttributeWorker::DynamicMouseHook(int code, WPARAM wParam, LPARAM lParam)
++{
++    if (code >= 0 && s_InputWorker)
++    {
++        if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN || wParam == WM_MBUTTONDOWN ||
++            wParam == WM_XBUTTONDOWN || wParam == WM_MOUSEWHEEL || wParam == WM_MOUSEHWHEEL)
++            s_InputWorker->SignalDynamicInput(true);
++        else if (wParam == WM_MOUSEMOVE && s_InputWorker->m_HoverTracking.load())
++        {
++            static thread_local ULONGLONG lastMove = 0;
++            const auto now = GetTickCount64();
++            if (now - lastMove >= 50) { lastMove = now; s_InputWorker->SignalDynamicInput(false); }
++        }
++    }
++    return CallNextHookEx(nullptr, code, wParam, lParam);
++}
++
++void TaskbarAttributeWorker::StartDynamicTickThread()
++{
++    m_DynamicTickStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
++    m_DynamicTickWakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++    if (!m_DynamicTickStopEvent || !m_DynamicTickWakeEvent)
++        LastErrorHandle(spdlog::level::critical, L"Failed to create tint scheduler events");
++    m_DynamicTickThread = std::thread([this]
++    {
++        s_InputWorker = this;
++        wil::unique_hhook keyboard, mouse;
++        const HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
++        const HANDLE handles[] {m_DynamicTickStopEvent, m_DynamicTickWakeEvent, timer};
++        // Establish this thread's queue before installing low-level input hooks.
++        MSG message;
++        PeekMessageW(&message, nullptr, 0, 0, PM_NOREMOVE);
++        bool hadMonitoring = false;
++        while (!m_DynamicTickStop.load())
++        {
++            const bool monitoring = m_InputMonitoring.load();
++            if (monitoring != hadMonitoring)
++            {
++                keyboard.reset(); mouse.reset();
++                if (monitoring)
++                {
++                    keyboard.reset(SetWindowsHookExW(WH_KEYBOARD_LL, DynamicKeyboardHook, GetModuleHandleW(nullptr), 0));
++                    mouse.reset(SetWindowsHookExW(WH_MOUSE_LL, DynamicMouseHook, GetModuleHandleW(nullptr), 0));
++                    if (!keyboard || !mouse) MessagePrint(spdlog::level::warn, L"Input hint hook unavailable; low-rate fallback remains active");
++                }
++                hadMonitoring = monitoring;
++            }
++            const unsigned ms = m_DynamicTickMs.load();
++            LARGE_INTEGER due { };
++            due.QuadPart = -static_cast<LONGLONG>(std::max(1u, ms)) * 10000LL;
++            const bool armed = timer && ms != INFINITE && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
++            if (timer && ms == INFINITE) CancelWaitableTimer(timer);
++            const DWORD count = armed ? 3 : 2;
++            // Pumping hook messages must not restart the capture deadline. Keep
++            // waiting on the same timer until it fires or the UI reschedules it.
++            for (;;)
++            {
++                const DWORD result = MsgWaitForMultipleObjects(count, handles, FALSE, armed ? INFINITE : ms, QS_ALLINPUT);
++                if (result == WAIT_OBJECT_0 || m_DynamicTickStop.load()) break;
++                if (result == WAIT_OBJECT_0 + 1) break;
++                if (result == WAIT_OBJECT_0 + count)
++                {
++                    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
++                    {
++                        TranslateMessage(&message);
++                        DispatchMessageW(&message);
++                    }
++                    continue;
++                }
++                if (result == WAIT_TIMEOUT || (armed && result == WAIT_OBJECT_0 + 2))
++                {
++                    if (!m_DynamicTickPosted.exchange(true))
++                        if (!PostMessageW(m_WindowHandle, WM_TIMER, static_cast<WPARAM>(m_DynamicTimerId), 0)) m_DynamicTickPosted.store(false);
++                    break;
++                }
++                WaitForSingleObject(m_DynamicTickStopEvent, 50);
++                break;
++            }
++        }
++        keyboard.reset(); mouse.reset();
++        s_InputWorker = nullptr;
++        if (timer) CloseHandle(timer);
++    });
+ }
+ 
+ void TaskbarAttributeWorker::DumpState()
+@@ -1576,6 +2400,26 @@
+ 
+ TaskbarAttributeWorker::~TaskbarAttributeWorker() noexcept(false)
+ {
++	m_DynamicTickStop = true;
++	if (m_DynamicTickStopEvent)
++	{
++		SetEvent(m_DynamicTickStopEvent);
++	}
++	if (m_DynamicTickThread.joinable())
++	{
++		m_DynamicTickThread.join();
++	}
++	if (m_DynamicTickStopEvent)
++	{
++		CloseHandle(m_DynamicTickStopEvent);
++		m_DynamicTickStopEvent = nullptr;
++	}
++
++	if (m_DynamicTickWakeEvent)
++	{
++		CloseHandle(m_DynamicTickWakeEvent);
++		m_DynamicTickWakeEvent = nullptr;
++	}
+ 	m_disableAttributeRefreshReply = true;
+ 	UnregisterTaskViewCallbacks();
+ 	UnregisterSearchCallbacks();
+diff --git a/TranslucentTB/taskbar/taskbarattributeworker.hpp b/TranslucentTB/taskbar/taskbarattributeworker.hpp
+--- a/TranslucentTB/taskbar/taskbarattributeworker.hpp
++++ b/TranslucentTB/taskbar/taskbarattributeworker.hpp
+@@ -1,6 +1,9 @@
+-#pragma once
++﻿#pragma once
+ #include "arch.h"
+ #include <array>
++#include <atomic>
++#include <deque>
++#include <thread>
+ #include <chrono>
+ #include <member_thunk/page.hpp>
+ #include <optional>
+@@ -17,6 +20,9 @@
+ #include <winrt/WindowsUdk.UI.Shell.h> // this is less evil
+ 
+ #include "config/taskbarappearance.hpp"
++#include "config/dynamictint.hpp"
++#include "dynamictint.hpp"
++#include "util/dynamictintschedule.hpp"
+ #include "../dynamicloader.hpp"
+ #include "../ExplorerHooks/api.hpp"
+ #include "../ExplorerTAP/api.hpp"
+@@ -142,6 +148,63 @@
+ 	// Color previews
+ 	std::array<std::optional<Util::Color>, 7> m_ColorPreviews;
+ 
++	// Dynamic tint: acrylic colours sampled from the content behind the bar.
++	UINT_PTR m_DynamicTimerId = 0;
++	std::thread m_DynamicTickThread;
++	std::atomic<bool> m_DynamicTickStop { false };
++	std::atomic<unsigned> m_DynamicTickMs { 500 };
++	HANDLE m_DynamicTickStopEvent = nullptr;
++	void StartDynamicTickThread();
++	void ScheduleDynamicTick(unsigned milliseconds);
++	void SignalDynamicInput(bool content);
++	static LRESULT CALLBACK DynamicKeyboardHook(int code, WPARAM wParam, LPARAM lParam);
++	static LRESULT CALLBACK DynamicMouseHook(int code, WPARAM wParam, LPARAM lParam);
++	static thread_local TaskbarAttributeWorker *s_InputWorker;
++	static constexpr UINT WM_DYNAMIC_INPUT = WM_APP + 0x3A0;
++	HANDLE m_DynamicTickWakeEvent = nullptr;
++	std::atomic<bool> m_DynamicTickPosted { false }, m_InputPosted { false }, m_InputContent { false };
++	std::atomic<bool> m_InputMonitoring { false }, m_HoverTracking { false };
++	DynamicTintSchedule m_DynamicSchedule;
++	UINT m_DynamicStatsMessage = RegisterWindowMessageW(L"TranslucentTB.DynamicTint.Stats.v1");
++	std::uint64_t m_DynamicTicks = 0, m_DynamicCaptures = 0, m_DynamicWrites = 0, m_DynamicInputs = 0;
++	std::uint64_t m_DynamicStops = 0;
++	bool m_DynamicRunning = false;
++	UINT m_DynamicInterval = 0;
++	std::unordered_map<HMONITOR, std::vector<Util::Color>> m_DynamicColors;
++	std::unordered_map<HMONITOR, std::vector<Util::Color>> m_DynamicTargets;
++
++	struct ZoneTransition
++	{
++		Util::Color From;
++		Util::Color To;
++		std::chrono::steady_clock::time_point Start;
++		int DurationMs = 0;
++		bool Active = false;
++	};
++	std::unordered_map<HMONITOR, std::vector<ZoneTransition>> m_DynamicTransitions;
++	std::unordered_map<HMONITOR, std::deque<std::vector<Util::Color>>> m_DynamicHistory;
++	std::chrono::steady_clock::time_point m_LastDynamicSample;
++	bool m_ShellFrozen = false;
++	std::chrono::steady_clock::time_point m_ShellFreezeStart;
++	ULONGLONG m_ShellDismissUntil = 0;
++	HWND m_LastDynamicForeground = nullptr;
++	bool m_DynamicPreviewCancelled = false;
++	bool m_ShellFastResume = false;
++	// A foreground change permits a settled sample while still on the bar.
++	// Only its cached target is animated; later thumbnails cannot resample it.
++	bool m_HoverRefreshPending = false;
++	ULONGLONG m_HoverRefreshAfter = 0;
++	bool m_HoverAnimating = false;
++	// Explorer creates its content after activation. Only events rooted in
++	// that foreground window may rearm a snapshot during this bounded startup.
++	HWND m_HoverStartupWindow = nullptr;
++	ULONGLONG m_HoverStartupUntil = 0;
++	void RefreshDynamicTintAfterContentChange(HWND hwnd);
++
++	// Keep long thumbnail interactions protected, but cancel the inferred
++	// preview neighbourhood on taskbar clicks or foreground changes.
++	HMONITOR m_DynamicPreviewMonitor = nullptr;
++
+ 	// Hook DLL
+ 	LoadableDll m_HookDll;
+ 	PFN_INJECT_EXPLORER_HOOK m_InjectExplorerHook;
+@@ -187,6 +250,11 @@
+ 	void SetAttribute(taskbar_iterator taskbar, TaskbarAppearance config);
+ 	void RefreshAttribute(taskbar_iterator taskbar);
+ 	void RefreshAllAttributes();
++
++	// Dynamic tint
++	void UpdateDynamicTint();
++	void StopDynamicTint(std::wstring_view reason);
++	bool IsFullscreenOnMonitor(HMONITOR monitor) const;
+ 
+ 	// Log
+ 	static void LogWindowInsertion(const std::pair<std::unordered_set<Window>::iterator, bool> &result, std::wstring_view state, HMONITOR mon);
+@@ -270,6 +338,8 @@
+ 
+ 	inline void ConfigurationChanged()
+ 	{
++		m_DynamicSchedule.Reset();
++		UpdateDynamicTint();
+ 		RefreshAllAttributes();
+ 	}
+ 
+diff --git a/Xaml/Pages/DynamicTintSettingsPage.cpp b/Xaml/Pages/DynamicTintSettingsPage.cpp
+new file mode 100644
+--- /dev/null
++++ b/Xaml/Pages/DynamicTintSettingsPage.cpp
+@@ -0,0 +1,56 @@
++#include "pch.h"
++#include "DynamicTintSettingsPage.h"
++#if __has_include("Pages/DynamicTintSettingsPage.g.cpp")
++#include "Pages/DynamicTintSettingsPage.g.cpp"
++#endif
++#include <cmath>
++
++namespace winrt::TranslucentTB::Xaml::Pages::implementation
++{
++    DynamicTintSettingsPage::DynamicTintSettingsPage(int32_t zones, int32_t fps, int32_t samplesPerSecond, int32_t sampleDepth, bool adaptiveSampling) :
++        m_AdaptiveSampling(adaptiveSampling), m_Zones(zones), m_Fps(fps), m_SamplesPerSecond(samplesPerSecond), m_SampleDepth(sampleDepth)
++    { }
++
++    void DynamicTintSettingsPage::InitializeComponent()
++    {
++        ComponentConnectorT::InitializeComponent();
++        SamplingModeBox().SelectedIndex(m_AdaptiveSampling ? 0 : 1);
++        ZonesBox().Value(m_Zones);
++        FpsBox().Value(m_Fps);
++        SamplingBox().Value(m_SamplesPerSecond);
++        DepthBox().Value(m_SampleDepth);
++    }
++
++    void DynamicTintSettingsPage::ApplyClicked(const IInspectable &, const wux::RoutedEventArgs &)
++    {
++        const auto valid = [](double value, int minimum, int maximum) noexcept
++        {
++            return std::isfinite(value) && value == std::floor(value) && value >= minimum && value <= maximum;
++        };
++        const double zones = ZonesBox().Value(), fps = FpsBox().Value();
++        const double sampling = SamplingBox().Value(), depth = DepthBox().Value();
++        if (!valid(zones, 1, 32) || !valid(fps, 20, 120) || !valid(sampling, 1, 60) || !valid(depth, 0, 4096))
++        {
++            ValidationMessage().Visibility(wux::Visibility::Visible);
++            return;
++        }
++        m_ParametersCommitted(static_cast<int32_t>(zones), static_cast<int32_t>(fps),
++            static_cast<int32_t>(sampling), static_cast<int32_t>(depth), SamplingModeBox().SelectedIndex() == 0);
++        base_type::Close();
++    }
++
++    void DynamicTintSettingsPage::CancelClicked(const IInspectable &, const wux::RoutedEventArgs &)
++    {
++        base_type::Close();
++    }
++
++    void DynamicTintSettingsPage::DefaultsClicked(const IInspectable &, const wux::RoutedEventArgs &)
++    {
++        SamplingModeBox().SelectedIndex(0);
++        ZonesBox().Value(20);
++        FpsBox().Value(60);
++        SamplingBox().Value(30);
++        DepthBox().Value(0);
++        ValidationMessage().Visibility(wux::Visibility::Collapsed);
++    }
++}
+diff --git a/Xaml/Pages/DynamicTintSettingsPage.h b/Xaml/Pages/DynamicTintSettingsPage.h
+new file mode 100644
+--- /dev/null
++++ b/Xaml/Pages/DynamicTintSettingsPage.h
+@@ -0,0 +1,27 @@
++#pragma once
++#include "../event.h"
++#include "../factory.h"
++#include "winrt.hpp"
++#include "FramelessPage.h"
++#include "Pages/DynamicTintSettingsPage.g.h"
++
++namespace winrt::TranslucentTB::Xaml::Pages::implementation
++{
++    struct DynamicTintSettingsPage : wux::Markup::ComponentConnectorT<DynamicTintSettingsPageT<DynamicTintSettingsPage>>
++    {
++        DynamicTintSettingsPage(int32_t zones, int32_t fps, int32_t samplesPerSecond, int32_t sampleDepth, bool adaptiveSampling);
++        void InitializeComponent();
++
++        DECL_EVENT(DynamicTintParametersCommittedDelegate, ParametersCommitted, m_ParametersCommitted);
++
++        void ApplyClicked(const IInspectable &sender, const wux::RoutedEventArgs &args);
++        void CancelClicked(const IInspectable &sender, const wux::RoutedEventArgs &args);
++        void DefaultsClicked(const IInspectable &sender, const wux::RoutedEventArgs &args);
++
++    private:
++        bool m_AdaptiveSampling;
++        int32_t m_Zones, m_Fps, m_SamplesPerSecond, m_SampleDepth;
++    };
++}
++
++FACTORY(winrt::TranslucentTB::Xaml::Pages, DynamicTintSettingsPage);
+diff --git a/Xaml/Pages/DynamicTintSettingsPage.idl b/Xaml/Pages/DynamicTintSettingsPage.idl
+new file mode 100644
+--- /dev/null
++++ b/Xaml/Pages/DynamicTintSettingsPage.idl
+@@ -0,0 +1,12 @@
++import "Pages/FramelessPage.idl";
++
++namespace TranslucentTB.Xaml.Pages
++{
++    delegate void DynamicTintParametersCommittedDelegate(Int32 zones, Int32 fps, Int32 samplesPerSecond, Int32 sampleDepth, Boolean adaptiveSampling);
++
++    runtimeclass DynamicTintSettingsPage : FramelessPage
++    {
++        DynamicTintSettingsPage(Int32 zones, Int32 fps, Int32 samplesPerSecond, Int32 sampleDepth, Boolean adaptiveSampling);
++        event DynamicTintParametersCommittedDelegate ParametersCommitted;
++    }
++}
+diff --git a/Xaml/Pages/DynamicTintSettingsPage.xaml b/Xaml/Pages/DynamicTintSettingsPage.xaml
+new file mode 100644
+--- /dev/null
++++ b/Xaml/Pages/DynamicTintSettingsPage.xaml
+@@ -0,0 +1,29 @@
++<local:FramelessPage
++    x:Class="TranslucentTB.Xaml.Pages.DynamicTintSettingsPage"
++    x:Uid="DynamicTintSettingsPage"
++    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
++    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
++    xmlns:local="using:TranslucentTB.Xaml.Pages"
++    xmlns:muxc="using:Microsoft.UI.Xaml.Controls"
++    IsClosable="True" Width="440">
++    <ScrollViewer MaxHeight="620" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
++        <StackPanel Margin="24,16,24,24" Spacing="12">
++            <TextBlock x:Uid="DynamicTintSettingsPage_Intro" TextWrapping="Wrap" />
++            <ComboBox x:Name="SamplingModeBox" x:Uid="DynamicTintSettingsPage_Mode" HorizontalAlignment="Stretch">
++                <ComboBoxItem x:Uid="DynamicTintSettingsPage_Adaptive" />
++                <ComboBoxItem x:Uid="DynamicTintSettingsPage_Continuous" />
++            </ComboBox>
++            <muxc:NumberBox x:Name="ZonesBox" x:Uid="DynamicTintSettingsPage_Zones" Minimum="1" Maximum="32" SmallChange="1" LargeChange="4" SpinButtonPlacementMode="Inline" />
++            <muxc:NumberBox x:Name="FpsBox" x:Uid="DynamicTintSettingsPage_Fps" Minimum="20" Maximum="120" SmallChange="1" LargeChange="10" SpinButtonPlacementMode="Inline" />
++            <muxc:NumberBox x:Name="SamplingBox" x:Uid="DynamicTintSettingsPage_Sampling" Minimum="1" Maximum="60" SmallChange="1" LargeChange="5" SpinButtonPlacementMode="Inline" />
++            <muxc:NumberBox x:Name="DepthBox" x:Uid="DynamicTintSettingsPage_Depth" Minimum="0" Maximum="4096" SmallChange="1" LargeChange="16" SpinButtonPlacementMode="Inline" />
++            <TextBlock x:Uid="DynamicTintSettingsPage_Help" TextWrapping="Wrap" FontSize="12" Opacity="0.8" />
++            <TextBlock x:Name="ValidationMessage" x:Uid="DynamicTintSettingsPage_Error" TextWrapping="Wrap" Foreground="Firebrick" Visibility="Collapsed" />
++            <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right" Margin="0,8,0,0">
++                <Button x:Uid="DynamicTintSettingsPage_Defaults" Click="DefaultsClicked" />
++                <Button x:Uid="DynamicTintSettingsPage_Cancel" Click="CancelClicked" />
++                <Button x:Uid="DynamicTintSettingsPage_Apply" Click="ApplyClicked" Style="{StaticResource AccentButtonStyle}" />
++            </StackPanel>
++        </StackPanel>
++    </ScrollViewer>
++</local:FramelessPage>
+diff --git a/Xaml/Pages/TrayFlyoutPage.cpp b/Xaml/Pages/TrayFlyoutPage.cpp
+--- a/Xaml/Pages/TrayFlyoutPage.cpp
++++ b/Xaml/Pages/TrayFlyoutPage.cpp
+@@ -114,6 +114,21 @@
+ 		}
+ 	}
+ 
++	void TrayFlyoutPage::SetDynamicTintState(const bool &enabled)
++	{
++		DynamicTintToggle().IsChecked(enabled);
++	}
++
++	void TrayFlyoutPage::DynamicTintSettingsClicked(const IInspectable &, const wux::RoutedEventArgs &)
++	{
++		m_DynamicTintSettingsRequested();
++	}
++
++	void TrayFlyoutPage::DynamicTintClicked(const IInspectable &, const wux::RoutedEventArgs &)
++	{
++		m_DynamicTintChangedDelegate(DynamicTintToggle().IsChecked());
++	}
++
+ 	void TrayFlyoutPage::SetDisableSavingSettings(const bool &disabled)
+ 	{
+ 		DisableSavingSettings().IsChecked(disabled);
+diff --git a/Xaml/Pages/TrayFlyoutPage.h b/Xaml/Pages/TrayFlyoutPage.h
+--- a/Xaml/Pages/TrayFlyoutPage.h
++++ b/Xaml/Pages/TrayFlyoutPage.h
+@@ -25,6 +25,8 @@
+ 
+ 		DECL_EVENT(TaskbarSettingsChangedDelegate, TaskbarSettingsChanged, m_TaskbarSettingsChangedDelegate);
+ 		DECL_EVENT(ColorRequestedDelegate, ColorRequested, m_ColorRequestedDelegate);
++		DECL_EVENT(DynamicTintChangedDelegate, DynamicTintChanged, m_DynamicTintChangedDelegate);
++		DECL_EVENT(DynamicTintSettingsRequestedDelegate, DynamicTintSettingsRequested, m_DynamicTintSettingsRequested);
+ 
+ 		DECL_EVENT(OpenLogFileRequestedDelegate, OpenLogFileRequested, m_OpenLogFileRequestedDelegate);
+ 		DECL_EVENT(LogLevelChangedDelegate, LogLevelChanged, m_LogLevelChangedDelegate);
+@@ -44,6 +46,9 @@
+ 		void SetTaskbarType(const txmp::TaskbarType &type);
+ 		void SetLogLevel(const txmp::LogLevel &level);
+ 		void SetDisableSavingSettings(const bool &disabled);
++		void SetDynamicTintState(const bool &enabled);
++		void DynamicTintSettingsClicked(const IInspectable &sender, const wux::RoutedEventArgs &args);
++		void DynamicTintClicked(const IInspectable &sender, const wux::RoutedEventArgs &args);
+ 		void SetStartupState(const wf::IReference<Windows::ApplicationModel::StartupTaskState> &state);
+ 
+ 		DECL_PROPERTY_CHANGED_FUNCS(txmp::LogSinkState, SinkState, m_SinkState);
+diff --git a/Xaml/Pages/TrayFlyoutPage.idl b/Xaml/Pages/TrayFlyoutPage.idl
+--- a/Xaml/Pages/TrayFlyoutPage.idl
++++ b/Xaml/Pages/TrayFlyoutPage.idl
+@@ -7,6 +7,8 @@
+ namespace TranslucentTB.Xaml.Pages
+ {
+ 	delegate void TaskbarSettingsChangedDelegate(TranslucentTB.Xaml.Models.Primitives.TaskbarState state, TranslucentTB.Xaml.Models.Primitives.TaskbarAppearance appearance);
++	delegate void DynamicTintChangedDelegate(Boolean enabled);
++	delegate void DynamicTintSettingsRequestedDelegate();
+ 	delegate void ColorRequestedDelegate(TranslucentTB.Xaml.Models.Primitives.TaskbarState state);
+ 
+ 	delegate void OpenLogFileRequestedDelegate();
+@@ -29,6 +31,8 @@
+ 
+ 		event TaskbarSettingsChangedDelegate TaskbarSettingsChanged;
+ 		event ColorRequestedDelegate ColorRequested;
++		event DynamicTintChangedDelegate DynamicTintChanged;
++		event DynamicTintSettingsRequestedDelegate DynamicTintSettingsRequested;
+ 
+ 		event OpenLogFileRequestedDelegate OpenLogFileRequested;
+ 		event LogLevelChangedDelegate LogLevelChanged;
+@@ -48,6 +52,7 @@
+ 		void SetTaskbarType(TranslucentTB.Xaml.Models.Primitives.TaskbarType type);
+ 		void SetLogLevel(TranslucentTB.Xaml.Models.Primitives.LogLevel level);
+ 		void SetDisableSavingSettings(Boolean disabled);
++		void SetDynamicTintState(Boolean enabled);
+ 		void SetStartupState(Windows.Foundation.IReference<Windows.ApplicationModel.StartupTaskState> state);
+ 
+ 		TranslucentTB.Xaml.Models.Primitives.LogSinkState SinkState;
+diff --git a/Xaml/Pages/TrayFlyoutPage.xaml b/Xaml/Pages/TrayFlyoutPage.xaml
+--- a/Xaml/Pages/TrayFlyoutPage.xaml
++++ b/Xaml/Pages/TrayFlyoutPage.xaml
+@@ -1,4 +1,4 @@
+-<Page
++﻿<Page
+     x:Class="TranslucentTB.Xaml.Pages.TrayFlyoutPage"
+     x:Uid="TrayFlyoutPage"
+     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+@@ -312,6 +312,8 @@
+                     </muxc:RadioMenuFlyoutItem.Tag>
+                 </muxc:RadioMenuFlyoutItem>
+             </MenuFlyoutSubItem>
++            <ToggleMenuFlyoutItem x:Name="DynamicTintToggle" x:Uid="TrayFlyoutPage_DynamicTint" Style="{StaticResource MergeIconsToggleMenuFlyoutItem}" Click="DynamicTintClicked" />
++            <MenuFlyoutItem x:Uid="TrayFlyoutPage_DynamicTintSettings" Style="{StaticResource MergeIconsMenuFlyoutItem}" Click="DynamicTintSettingsClicked" />
+             <MenuFlyoutSeparator />
+             <MenuFlyoutSubItem x:Uid="TrayFlyoutPage_Advanced" Style="{StaticResource MergeIconsMenuFlyoutSubItem}">
+                 <MenuFlyoutSubItem.Icon>
+diff --git a/Xaml/Strings/en-US/Resources.resw b/Xaml/Strings/en-US/Resources.resw
+--- a/Xaml/Strings/en-US/Resources.resw
++++ b/Xaml/Strings/en-US/Resources.resw
+@@ -301,4 +301,46 @@
+   <data name="WelcomePage_Message_Suffix.Text" xml:space="preserve">
+     <value>if you have any problem or want to see a feature added!</value>
+   </data>
++  <data name="TrayFlyoutPage_DynamicTint.Text" xml:space="preserve">
++    <value>Dynamic tint</value>
++  </data>
++  <data name="TrayFlyoutPage_DynamicTintSettings.Text" xml:space="preserve">
++    <value>Dynamic tint settings...</value>
++  </data>
++  <data name="DynamicTintSettingsPage.Title" xml:space="preserve">
++    <value>Dynamic tint settings</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Intro.Text" xml:space="preserve">
++    <value>Changes apply when you choose Apply.</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Zones.Header" xml:space="preserve">
++    <value>Color zones (1–32)</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Fps.Header" xml:space="preserve">
++    <value>Rendering frames per second (20–120)</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Sampling.Header" xml:space="preserve">
++    <value>Screen samples per second (1–60)</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Depth.Header" xml:space="preserve">
++    <value>Sample depth in pixels (0 = automatic)</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Help.Text" xml:space="preserve">
++    <value>Adaptive: 1–2 idle samples/s, up to 20/s while content changes, bounded by sampling frequency. Animation uses the rendering rate only while transitioning. Continuous preserves the original behaviour.</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Error.Text" xml:space="preserve">
++    <value>Enter whole numbers within the displayed ranges.</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Defaults.Content" xml:space="preserve">
++    <value>Defaults</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Cancel.Content" xml:space="preserve">
++    <value>Cancel</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Apply.Content" xml:space="preserve">
++    <value>Apply</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Mode.Header" xml:space="preserve"><value>Sampling mode</value></data>
++  <data name="DynamicTintSettingsPage_Adaptive.Content" xml:space="preserve"><value>Adaptive (events + low-rate fallback)</value></data>
++  <data name="DynamicTintSettingsPage_Continuous.Content" xml:space="preserve"><value>Continuous (configured sampling rate)</value></data>
+ </root>
+\ No newline at end of file
+diff --git a/Xaml/Strings/zh-CN/Resources.resw b/Xaml/Strings/zh-CN/Resources.resw
+--- a/Xaml/Strings/zh-CN/Resources.resw
++++ b/Xaml/Strings/zh-CN/Resources.resw
+@@ -292,4 +292,46 @@
+   <data name="WelcomePage_Message_Suffix.Text" xml:space="preserve">
+     <value>祝你使用愉快！</value>
+   </data>
++  <data name="TrayFlyoutPage_DynamicTint.Text" xml:space="preserve">
++    <value>动态取色</value>
++  </data>
++  <data name="TrayFlyoutPage_DynamicTintSettings.Text" xml:space="preserve">
++    <value>动态取色参数…</value>
++  </data>
++  <data name="DynamicTintSettingsPage.Title" xml:space="preserve">
++    <value>动态取色参数</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Intro.Text" xml:space="preserve">
++    <value>点击“应用”后生效，并保存设置。</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Zones.Header" xml:space="preserve">
++    <value>分区列数（1–32）</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Fps.Header" xml:space="preserve">
++    <value>渲染帧率（20–120 FPS）</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Sampling.Header" xml:space="preserve">
++    <value>采样频率（1–60 次/秒）</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Depth.Header" xml:space="preserve">
++    <value>采样深度（像素，0 = 自动）</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Help.Text" xml:space="preserve">
++    <value>自适应：静态每秒1–2次，变化时最高20次，并受采样频率限制；仅渐变期间使用渲染帧率。连续模式保留原来的持续采样行为。</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Error.Text" xml:space="preserve">
++    <value>请输入所示范围内的整数。</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Defaults.Content" xml:space="preserve">
++    <value>恢复默认</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Cancel.Content" xml:space="preserve">
++    <value>取消</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Apply.Content" xml:space="preserve">
++    <value>应用</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Mode.Header" xml:space="preserve"><value>采样方式</value></data>
++  <data name="DynamicTintSettingsPage_Adaptive.Content" xml:space="preserve"><value>自适应（事件触发＋低频兜底）</value></data>
++  <data name="DynamicTintSettingsPage_Continuous.Content" xml:space="preserve"><value>连续（按设定频率采样）</value></data>
+ </root>
+\ No newline at end of file
+diff --git a/Xaml/Strings/zh-TW/Resources.resw b/Xaml/Strings/zh-TW/Resources.resw
+--- a/Xaml/Strings/zh-TW/Resources.resw
++++ b/Xaml/Strings/zh-TW/Resources.resw
+@@ -292,4 +292,46 @@
+   <data name="WelcomePage_Message_Suffix.Text" xml:space="preserve">
+     <value>。祝您使用愉快！</value>
+   </data>
++  <data name="TrayFlyoutPage_DynamicTint.Text" xml:space="preserve">
++    <value>動態取色</value>
++  </data>
++  <data name="TrayFlyoutPage_DynamicTintSettings.Text" xml:space="preserve">
++    <value>動態取色參數…</value>
++  </data>
++  <data name="DynamicTintSettingsPage.Title" xml:space="preserve">
++    <value>動態取色參數</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Intro.Text" xml:space="preserve">
++    <value>按下「套用」後生效，並儲存設定。</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Zones.Header" xml:space="preserve">
++    <value>分區欄數（1–32）</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Fps.Header" xml:space="preserve">
++    <value>繪製影格率（20–120 FPS）</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Sampling.Header" xml:space="preserve">
++    <value>取樣頻率（每秒 1–60 次）</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Depth.Header" xml:space="preserve">
++    <value>取樣深度（像素，0 = 自動）</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Help.Text" xml:space="preserve">
++    <value>自適應：靜態每秒1–2次，變化時最高20次，並受取樣頻率限制；僅漸變期間使用繪製影格率。連續模式保留原本的持續取樣行為。</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Error.Text" xml:space="preserve">
++    <value>請輸入所示範圍內的整數。</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Defaults.Content" xml:space="preserve">
++    <value>還原預設</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Cancel.Content" xml:space="preserve">
++    <value>取消</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Apply.Content" xml:space="preserve">
++    <value>套用</value>
++  </data>
++  <data name="DynamicTintSettingsPage_Mode.Header" xml:space="preserve"><value>取樣方式</value></data>
++  <data name="DynamicTintSettingsPage_Adaptive.Content" xml:space="preserve"><value>自適應（事件觸發＋低頻補查）</value></data>
++  <data name="DynamicTintSettingsPage_Continuous.Content" xml:space="preserve"><value>連續（依設定頻率取樣）</value></data>
+ </root>
+\ No newline at end of file
+diff --git a/Xaml/Xaml.vcxproj b/Xaml/Xaml.vcxproj
+--- a/Xaml/Xaml.vcxproj
++++ b/Xaml/Xaml.vcxproj
+@@ -131,6 +131,10 @@
+       <DependentUpon>Models\Primitives\TaskbarAppearance.idl</DependentUpon>
+       <SubType>Code</SubType>
+     </ClCompile>
++    <ClCompile Include="Pages\DynamicTintSettingsPage.cpp">
++      <DependentUpon>Pages\DynamicTintSettingsPage.xaml</DependentUpon>
++      <SubType>Code</SubType>
++    </ClCompile>
+     <ClCompile Include="Pages\ColorPickerPage.cpp">
+       <DependentUpon>Pages\ColorPickerPage.xaml</DependentUpon>
+       <SubType>Code</SubType>
+@@ -191,6 +195,9 @@
+     <Page Include="Controls\FocusBorderColorSpectrum.xaml">
+       <DeploymentContent>true</DeploymentContent>
+     </Page>
++    <Page Include="Pages\DynamicTintSettingsPage.xaml">
++      <SubType>Designer</SubType>
++    </Page>
+     <Page Include="Pages\ColorPickerPage.xaml">
+       <SubType>Designer</SubType>
+     </Page>
+@@ -284,6 +291,10 @@
+       <DependentUpon>Models\Primitives\TaskbarAppearance.idl</DependentUpon>
+       <SubType>Code</SubType>
+     </ClInclude>
++    <ClInclude Include="Pages\DynamicTintSettingsPage.h">
++      <DependentUpon>Pages\DynamicTintSettingsPage.xaml</DependentUpon>
++      <SubType>Code</SubType>
++    </ClInclude>
+     <ClInclude Include="Pages\ColorPickerPage.h">
+       <DependentUpon>Pages\ColorPickerPage.xaml</DependentUpon>
+       <SubType>Code</SubType>
+@@ -405,6 +416,10 @@
+     </Midl>
+     <Midl Include="Models\Primitives\TaskbarState.idl">
+       <SubType>Designer</SubType>
++    </Midl>
++    <Midl Include="Pages\DynamicTintSettingsPage.idl">
++      <DependentUpon>Pages\DynamicTintSettingsPage.xaml</DependentUpon>
++      <SubType>Code</SubType>
+     </Midl>
+     <Midl Include="Pages\ColorPickerPage.idl">
+       <DependentUpon>Pages\ColorPickerPage.xaml</DependentUpon>
+diff --git a/settings.schema.json b/settings.schema.json
+--- a/settings.schema.json
++++ b/settings.schema.json
+@@ -1,4 +1,4 @@
+-{
++﻿{
+   "$schema": "https://json-schema.org/draft/2019-09/schema#",
+   "title": "TranslucentTB Settings Schema",
+   "$defs": {
+@@ -164,6 +164,102 @@
+     },
+     "copy_dlls": {
+       "type": "boolean"
++    },
++    "dynamic_tint": {
++      "properties": {
++        "enabled": {
++          "type": "boolean"
++        },
++        "only_fullscreen": {
++          "type": "boolean"
++        },
++        "samples_per_second": {
++          "type": "integer",
++          "minimum": 1,
++          "maximum": 60
++        },
++        "fps": {
++          "type": "integer",
++          "minimum": 20,
++          "maximum": 120
++        },
++        "smoothing": {
++          "type": "number",
++          "minimum": 0.01,
++          "maximum": 1
++        },
++        "min_value": {
++          "type": "number",
++          "minimum": 0,
++          "maximum": 1
++        },
++        "max_value": {
++          "type": "number",
++          "minimum": 0,
++          "maximum": 1
++        },
++        "saturation_boost": {
++          "type": "number",
++          "minimum": 0,
++          "maximum": 4
++        },
++        "alpha": {
++          "type": "integer",
++          "minimum": 0,
++          "maximum": 255
++        },
++        "sample_depth": {
++          "type": "integer",
++          "minimum": 0,
++          "maximum": 4096
++        },
++        "sample_width": {
++          "type": "integer",
++          "minimum": 4,
++          "maximum": 512
++        },
++        "zones": {
++          "type": "integer",
++          "minimum": 1,
++          "maximum": 32
++        },
++        "near_bias": {
++          "type": "number",
++          "minimum": 0,
++          "maximum": 1
++        },
++        "sample_interval": {
++          "type": "integer",
++          "minimum": 0,
++          "maximum": 1000
++        },
++        "median_window": {
++          "type": "integer",
++          "minimum": 1,
++          "maximum": 9
++        },
++        "deadband": {
++          "type": "integer",
++          "minimum": 0,
++          "maximum": 60
++        },
++        "cut_threshold": {
++          "type": "integer",
++          "minimum": 0,
++          "maximum": 765
++        },
++        "cut_duration_ms": {
++          "type": "integer",
++          "minimum": 40,
++          "maximum": 2000
++        },
++        "adaptive_sampling": {
++          "type": "boolean",
++          "default": true,
++          "description": "Event hints plus low-rate fallback; false preserves continuous sampling."
++        }
++      },
++      "type": "object"
+     }
+   },
+   "type": "object"
