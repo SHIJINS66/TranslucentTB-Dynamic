@@ -1,0 +1,27 @@
+# Local build/runtime/private material
+.vs/
+**/bin/
+**/obj/
+**/x64/
+**/vcpkg_installed/
+**/packages/
+*.exe
+*.dll
+*.pdb
+*.dmp
+*.log
+*.bak
+*.user
+*.suo
+*.pfx
+__pycache__/
+/settings.json
+/src/settings.json
+/benchmark-results/
+benchmarks/scripts/TaskbarSwitchDriver.exe
+/installer/stage/
+/installer/build/
+
+# Local publication drafts and backups
+/publication-drafts/
+/local-backups/

@@ -1,0 +1,6 @@
+* text=auto
+*.zip -text
+*.gz -text
+*.tar -text
+*.png -text
+*.ico -text
